@@ -1,0 +1,17 @@
+# Binaries and object files
+*.o
+switch
+host
+swctl
+switch_tsan
+host_tsan
+
+# Runtime logs, dumps, and sockets
+*.log
+*.sock
+mac_dump.txt
+
+# Assignment docs
+docs/
+*.pdf
+*.html
