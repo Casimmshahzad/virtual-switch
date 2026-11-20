@@ -15,6 +15,13 @@
 
 static _Atomic int g_host_running = 1;
 
+static void handle_host_sig(int sig) {
+    (void)sig;
+    int saved_errno = errno;
+    atomic_store_explicit(&g_host_running, 0, memory_order_relaxed);
+    errno = saved_errno;
+}
+
 typedef struct {
     int sock_fd;
     char host_mac_str[MAC_STR_LEN];
@@ -95,6 +102,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Handle SIGINT and SIGTERM for graceful exit */
+    struct sigaction sa_sig;
+    memset(&sa_sig, 0, sizeof(sa_sig));
+    sa_sig.sa_handler = handle_host_sig;
+    if (sigaction(SIGINT, &sa_sig, NULL) < 0 || sigaction(SIGTERM, &sa_sig, NULL) < 0) {
+        perror("sigaction");
+        return 1;
+    }
+
     int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (sock_fd < 0) {
         perror("socket");
@@ -119,6 +135,58 @@ int main(int argc, char *argv[]) {
 
     printf("[Host %s] Connected to switch at %s:%ld\n", host_mac_str, switch_ip, port);
     fflush(stdout);
+
+    /* Test mode: frozen host that never reads from socket */
+    if (argc >= 5 && strcmp(argv[4], "--no-read") == 0) {
+        /* Restrict receive buffer so TCP window fills quickly */
+        int rcvbuf = 4096;
+        if (setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+            perror("setsockopt(SO_RCVBUF)");
+        }
+        printf("[Host %s] Operating in no-read mode (frozen receiver)\n", host_mac_str);
+        fflush(stdout);
+        while (atomic_load_explicit(&g_host_running, memory_order_relaxed)) {
+            pause();
+        }
+        if (close(sock_fd) < 0) {
+            perror("close sock_fd");
+        }
+        return 0;
+    }
+
+    /* Test mode: dedicated receiver listening for incoming frames */
+    if (argc >= 5 && strcmp(argv[4], "--listen") == 0) {
+        printf("[Host %s] Operating in listen mode (receiving frames)\n", host_mac_str);
+        fflush(stdout);
+        while (atomic_load_explicit(&g_host_running, memory_order_relaxed)) {
+            frame_t rx_frame;
+            int rc = read_frame(sock_fd, &rx_frame);
+            if (rc == 0) {
+                printf("[Host %s] Switch closed connection\n", host_mac_str);
+                fflush(stdout);
+                break;
+            }
+            if (rc < 0) {
+                if (atomic_load_explicit(&g_host_running, memory_order_relaxed) && errno != EINTR && errno != EBADF) {
+                    printf("[Host %s] Receive error: %s\n", host_mac_str, strerror(errno));
+                    fflush(stdout);
+                }
+                break;
+            }
+
+            char src_str[MAC_STR_LEN], dst_str[MAC_STR_LEN];
+            mac_to_str(rx_frame.src, src_str, sizeof(src_str));
+            mac_to_str(rx_frame.dst, dst_str, sizeof(dst_str));
+            printf("[Host %s] RX: src=%s dst=%s vlan=%u prio=%u len=%u payload='%.*s'\n",
+                   host_mac_str, src_str, dst_str, rx_frame.vlan, rx_frame.priority,
+                   rx_frame.length, (int)rx_frame.length, rx_frame.payload);
+            fflush(stdout);
+        }
+        if (close(sock_fd) < 0) {
+            perror("close sock_fd");
+        }
+        return 0;
+    }
 
     /* If destination MAC is specified on CLI, send one frame and wait for response */
     if (argc >= 5) {
