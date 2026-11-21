@@ -1,4 +1,5 @@
 #include "protocol.h"
+#include "mac_table.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,13 +9,55 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <poll.h>
+#include <stdbool.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <stdbool.h>
 
 #define PORT_QUEUE_CAPACITY 32
+
+/*
+ * Shared frame with thread-safe reference count.
+ * Enqueued into multiple output queues without copying.
+ * Last sender to finish decrements refcount to 0 and frees it.
+ */
+typedef struct {
+    frame_t frame;
+    pthread_mutex_t lock;
+    int refcount;
+} shared_frame_t;
+
+static shared_frame_t *shared_frame_create(const frame_t *frame) {
+    shared_frame_t *sf = malloc(sizeof(*sf));
+    if (!sf) {
+        return NULL;
+    }
+    sf->frame = *frame;
+    int err = pthread_mutex_init(&sf->lock, NULL);
+    if (err != 0) {
+        free(sf);
+        return NULL;
+    }
+    /* Creator reference holds frame alive during candidate enqueue fan-out */
+    sf->refcount = 1;
+    return sf;
+}
+
+static void shared_frame_release(shared_frame_t *sf) {
+    if (!sf) {
+        return;
+    }
+    pthread_mutex_lock(&sf->lock);
+    sf->refcount--;
+    int remaining = sf->refcount;
+    pthread_mutex_unlock(&sf->lock);
+
+    if (remaining <= 0) {
+        pthread_mutex_destroy(&sf->lock);
+        free(sf);
+    }
+}
 
 typedef enum {
     PORT_STATE_FREE = 0,
@@ -35,7 +78,7 @@ typedef struct {
     pthread_mutex_t queue_mutex;
     pthread_cond_t queue_cond;
 
-    frame_t queue[PORT_QUEUE_CAPACITY];
+    shared_frame_t *queue[PORT_QUEUE_CAPACITY];
     int queue_head;
     int queue_tail;
     int queue_count;
@@ -48,6 +91,7 @@ typedef struct {
 static _Atomic int g_running = 1;
 static int g_num_ports = 0;
 static port_t *g_ports = NULL;
+static mac_table_t *g_mac_table = NULL;
 
 static void handle_signal(int sig) {
     (void)sig;
@@ -57,11 +101,26 @@ static void handle_signal(int sig) {
 }
 
 /*
- * Enqueues a frame to the port's output queue without blocking.
- * If queue is full, drops the frame immediately and increments frames_dropped.
+ * Drains any remaining queued shared frames and decrements their refcounts.
+ * Caller MUST hold port->queue_mutex.
  */
-static int port_enqueue(port_t *port, const frame_t *frame) {
-    if (!port || !frame) {
+static void port_drain_queue_locked(port_t *port) {
+    while (port->queue_count > 0) {
+        shared_frame_t *sf = port->queue[port->queue_head];
+        port->queue[port->queue_head] = NULL;
+        port->queue_head = (port->queue_head + 1) % PORT_QUEUE_CAPACITY;
+        port->queue_count--;
+        shared_frame_release(sf);
+    }
+}
+
+/*
+ * Enqueues a shared_frame_t to the port's output queue without blocking.
+ * If queue is full, increments frames_dropped and drops immediately (does not increment refcount).
+ * If space available, increments sf->refcount and enqueues.
+ */
+static int port_enqueue(port_t *port, shared_frame_t *sf) {
+    if (!port || !sf) {
         return -1;
     }
 
@@ -81,7 +140,12 @@ static int port_enqueue(port_t *port, const frame_t *frame) {
         return -1;
     }
 
-    port->queue[port->queue_tail] = *frame;
+    /* Reference count increments under sf->lock before queue insertion */
+    pthread_mutex_lock(&sf->lock);
+    sf->refcount++;
+    pthread_mutex_unlock(&sf->lock);
+
+    port->queue[port->queue_tail] = sf;
     port->queue_tail = (port->queue_tail + 1) % PORT_QUEUE_CAPACITY;
     port->queue_count++;
     pthread_cond_signal(&port->queue_cond);
@@ -90,16 +154,15 @@ static int port_enqueue(port_t *port, const frame_t *frame) {
 }
 
 /*
- * Sender thread: pops frames from queue and writes to socket.
- * Waits on condition variable when empty.
- * Socket writes are strictly performed outside queue_mutex to prevent HOL blocking.
+ * Sender thread: pops shared frames from queue and writes to socket.
+ * Performs write_frame() outside queue_mutex.
+ * Decrements shared frame refcount after sending.
  */
 static void *port_tx_thread(void *arg) {
     port_t *port = (port_t *)arg;
 
     while (1) {
-        frame_t frame;
-        bool has_frame = false;
+        shared_frame_t *sf = NULL;
 
         pthread_mutex_lock(&port->queue_mutex);
         while (port->queue_count == 0 &&
@@ -109,10 +172,10 @@ static void *port_tx_thread(void *arg) {
         }
 
         if (port->queue_count > 0) {
-            frame = port->queue[port->queue_head];
+            sf = port->queue[port->queue_head];
+            port->queue[port->queue_head] = NULL;
             port->queue_head = (port->queue_head + 1) % PORT_QUEUE_CAPACITY;
             port->queue_count--;
-            has_frame = true;
         } else if (atomic_load_explicit(&port->state, memory_order_relaxed) != PORT_STATE_ACTIVE ||
                    !atomic_load_explicit(&g_running, memory_order_relaxed)) {
             pthread_mutex_unlock(&port->queue_mutex);
@@ -120,11 +183,12 @@ static void *port_tx_thread(void *arg) {
         }
         pthread_mutex_unlock(&port->queue_mutex);
 
-        if (has_frame) {
-            /* Performed outside mutex so slow host never blocks other ports or receivers */
-            if (write_frame(port->fd, &frame) < 0) {
+        if (sf) {
+            if (write_frame(port->fd, &sf->frame) < 0) {
                 printf("[Switch] Port %d: TX write failed: %s\n", port->id, strerror(errno));
                 fflush(stdout);
+
+                shared_frame_release(sf);
 
                 pthread_mutex_lock(&port->queue_mutex);
                 atomic_store_explicit(&port->state, PORT_STATE_CLOSING, memory_order_relaxed);
@@ -134,6 +198,8 @@ static void *port_tx_thread(void *arg) {
             } else {
                 atomic_fetch_add_explicit(&port->frames_out, 1, memory_order_relaxed);
             }
+
+            shared_frame_release(sf);
         }
     }
 
@@ -146,7 +212,8 @@ static void *port_tx_thread(void *arg) {
 
 /*
  * Receiver thread: reads frames from host socket.
- * Floods incoming frames to all other active ports.
+ * Learns source MAC, checks port security, looks up destination in MAC table,
+ * and performs unicast forwarding or broadcast flooding with refcounted shared frames.
  */
 static void *port_rx_thread(void *arg) {
     port_t *port = (port_t *)arg;
@@ -187,13 +254,51 @@ static void *port_rx_thread(void *arg) {
                port->id, src_str, dst_str, frame.vlan, frame.priority, frame.length);
         fflush(stdout);
 
-        /* Flood incoming frame to all other active ports */
-        for (int i = 0; i < g_num_ports; i++) {
-            if (i == port->id) {
-                continue;
-            }
-            port_enqueue(&g_ports[i], &frame);
+        /* Learn source MAC and enforce port security */
+        int learn_rc = mac_table_learn(g_mac_table, frame.src, port->id);
+        if (learn_rc == MAC_TABLE_SECURITY_VIOLATION) {
+            printf("[Switch] Port %d: Port security shutdown triggered!\n", port->id);
+            fflush(stdout);
+            shutdown(port->fd, SHUT_RDWR);
+            break;
         }
+
+        /* Forwarding logic: unicast vs flood */
+        shared_frame_t *sf = shared_frame_create(&frame);
+        if (!sf) {
+            continue;
+        }
+
+        int dst_port = -1;
+        if (!mac_is_broadcast(frame.dst)) {
+            dst_port = mac_table_lookup(g_mac_table, frame.dst);
+        }
+
+        if (dst_port >= 0) {
+            /* Known destination MAC */
+            if (dst_port == port->id) {
+                /* Filtered: destination sits on the incoming port */
+                printf("[Switch] Port %d: Frame filtered (dest sits on same port)\n", port->id);
+                fflush(stdout);
+            } else {
+                printf("[Switch] Port %d: Unicast forwarding to port %d\n", port->id, dst_port);
+                fflush(stdout);
+                port_enqueue(&g_ports[dst_port], sf);
+            }
+        } else {
+            /* Broadcast or unknown unicast: flood to all other active ports */
+            printf("[Switch] Port %d: Flooding frame (dst=%s)\n", port->id, dst_str);
+            fflush(stdout);
+            for (int i = 0; i < g_num_ports; i++) {
+                if (i == port->id) {
+                    continue;
+                }
+                port_enqueue(&g_ports[i], sf);
+            }
+        }
+
+        /* Release creator reference; frame will be freed when all senders finish */
+        shared_frame_release(sf);
     }
 
     /* Wake sender and mark port closing */
@@ -234,11 +339,15 @@ static void reap_terminated_ports(void) {
             }
 
             pthread_mutex_lock(&g_ports[i].queue_mutex);
+            port_drain_queue_locked(&g_ports[i]);
             g_ports[i].queue_head = 0;
             g_ports[i].queue_tail = 0;
             g_ports[i].queue_count = 0;
             atomic_store_explicit(&g_ports[i].state, PORT_STATE_FREE, memory_order_relaxed);
             pthread_mutex_unlock(&g_ports[i].queue_mutex);
+
+            /* Flush MAC entries learned on this port */
+            mac_table_remove_port(g_mac_table, i);
 
             printf("[Switch] Port %d: Reaped and reset to free\n", i);
             fflush(stdout);
@@ -254,7 +363,6 @@ static int allocate_port(int client_fd) {
 
     for (int i = 0; i < g_num_ports; i++) {
         if (atomic_load_explicit(&g_ports[i].state, memory_order_relaxed) == PORT_STATE_FREE) {
-            /* Bound socket send buffer so queue backpressure triggers promptly on slow hosts */
             int sndbuf = 8192;
             if (setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {
                 perror("setsockopt(SO_SNDBUF)");
@@ -309,8 +417,8 @@ int main(int argc, char *argv[]) {
     }
 
     long num_ports = strtol(argv[2], &endptr, 10);
-    if (*endptr != '\0' || num_ports <= 0) {
-        fprintf(stderr, "Error: Invalid num_ports: %s\n", argv[2]);
+    if (*endptr != '\0' || num_ports <= 0 || num_ports > MAX_SWITCH_PORTS) {
+        fprintf(stderr, "Error: Invalid num_ports: %s (max %d)\n", argv[2], MAX_SWITCH_PORTS);
         return 1;
     }
 
@@ -330,6 +438,9 @@ int main(int argc, char *argv[]) {
         g_ports[i].queue_head = 0;
         g_ports[i].queue_tail = 0;
         g_ports[i].queue_count = 0;
+        for (int q = 0; q < PORT_QUEUE_CAPACITY; q++) {
+            g_ports[i].queue[q] = NULL;
+        }
         atomic_init(&g_ports[i].frames_in, 0);
         atomic_init(&g_ports[i].frames_out, 0);
         atomic_init(&g_ports[i].frames_dropped, 0);
@@ -344,6 +455,17 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "pthread_cond_init failed: %s\n", strerror(err));
             return 1;
         }
+    }
+
+    /* Initialize concurrent striped MAC table */
+    g_mac_table = malloc(sizeof(mac_table_t));
+    if (!g_mac_table) {
+        perror("malloc mac_table");
+        return 1;
+    }
+    if (mac_table_init(g_mac_table, 1024, 16, 30) < 0) {
+        fprintf(stderr, "mac_table_init failed\n");
+        return 1;
     }
 
     /* Ignore SIGPIPE so write() returns EPIPE on disconnected sockets */
@@ -481,10 +603,17 @@ int main(int argc, char *argv[]) {
                 g_ports[i].fd = -1;
             }
         }
+
+        pthread_mutex_lock(&g_ports[i].queue_mutex);
+        port_drain_queue_locked(&g_ports[i]);
+        pthread_mutex_unlock(&g_ports[i].queue_mutex);
+
         pthread_mutex_destroy(&g_ports[i].queue_mutex);
         pthread_cond_destroy(&g_ports[i].queue_cond);
     }
 
+    mac_table_destroy(g_mac_table);
+    free(g_mac_table);
     free(g_ports);
     return 0;
 }

@@ -158,6 +158,26 @@ int main(int argc, char *argv[]) {
     if (argc >= 5 && strcmp(argv[4], "--listen") == 0) {
         printf("[Host %s] Operating in listen mode (receiving frames)\n", host_mac_str);
         fflush(stdout);
+
+        /* Optional: send an initial frame to register MAC with switch */
+        if (argc >= 6) {
+            uint8_t init_dst[MAC_LEN];
+            if (mac_from_str(argv[5], init_dst) == 0) {
+                const char *msg = (argc >= 7) ? argv[6] : "hello";
+                frame_t init_frame;
+                memset(&init_frame, 0, sizeof(init_frame));
+                memcpy(init_frame.src, host_mac, MAC_LEN);
+                memcpy(init_frame.dst, init_dst, MAC_LEN);
+                init_frame.vlan = 1;
+                init_frame.priority = PRIORITY_NORMAL;
+                init_frame.length = (uint16_t)strlen(msg);
+                memcpy(init_frame.payload, msg, init_frame.length);
+                if (write_frame(sock_fd, &init_frame) < 0) {
+                    perror("write_frame initial registration");
+                }
+            }
+        }
+
         while (atomic_load_explicit(&g_host_running, memory_order_relaxed)) {
             frame_t rx_frame;
             int rc = read_frame(sock_fd, &rx_frame);
@@ -282,22 +302,30 @@ int main(int argc, char *argv[]) {
         char dst_str[64];
         char payload_str[1501];
         payload_str[0] = '\0';
+        uint8_t tx_src[MAC_LEN];
+        uint8_t tx_dst[MAC_LEN];
+        memcpy(tx_src, host_mac, MAC_LEN);
 
-        if (sscanf(line, "%63s %1500[^\n]", dst_str, payload_str) < 1) {
-            continue;
-        }
-
-        uint8_t dst_mac[MAC_LEN];
-        if (mac_from_str(dst_str, dst_mac) < 0) {
-            fprintf(stderr, "Error: Invalid destination MAC: %s\n", dst_str);
+        char spoof_src[64], spoof_dst[64];
+        if (sscanf(line, "spoof %63s %63s %1500[^\n]", spoof_src, spoof_dst, payload_str) >= 2) {
+            if (mac_from_str(spoof_src, tx_src) < 0 || mac_from_str(spoof_dst, tx_dst) < 0) {
+                fprintf(stderr, "Error: Invalid spoof MAC format\n");
+                continue;
+            }
+        } else if (sscanf(line, "%63s %1500[^\n]", dst_str, payload_str) >= 1) {
+            if (mac_from_str(dst_str, tx_dst) < 0) {
+                fprintf(stderr, "Error: Invalid destination MAC: %s\n", dst_str);
+                continue;
+            }
+        } else {
             continue;
         }
 
         frame_t tx_frame;
         memset(&tx_frame, 0, sizeof(tx_frame));
         tx_frame.length = (uint16_t)strlen(payload_str);
-        memcpy(tx_frame.src, host_mac, MAC_LEN);
-        memcpy(tx_frame.dst, dst_mac, MAC_LEN);
+        memcpy(tx_frame.src, tx_src, MAC_LEN);
+        memcpy(tx_frame.dst, tx_dst, MAC_LEN);
         tx_frame.vlan = 1;
         tx_frame.priority = PRIORITY_NORMAL;
         memcpy(tx_frame.payload, payload_str, tx_frame.length);
