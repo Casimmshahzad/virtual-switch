@@ -14,11 +14,16 @@
 #include <arpa/inet.h>
 
 static _Atomic int g_host_running = 1;
+static _Atomic int g_host_sock = -1;
 
 static void handle_host_sig(int sig) {
     (void)sig;
     int saved_errno = errno;
     atomic_store_explicit(&g_host_running, 0, memory_order_relaxed);
+    int fd = atomic_load_explicit(&g_host_sock, memory_order_relaxed);
+    if (fd >= 0) {
+        shutdown(fd, SHUT_RDWR);
+    }
     errno = saved_errno;
 }
 
@@ -132,6 +137,8 @@ int main(int argc, char *argv[]) {
         close(sock_fd);
         return 1;
     }
+
+    atomic_store_explicit(&g_host_sock, sock_fd, memory_order_relaxed);
 
     printf("[Host %s] Connected to switch at %s:%ld\n", host_mac_str, switch_ip, port);
     fflush(stdout);

@@ -70,6 +70,12 @@ int mac_table_lookup(mac_table_t *table, const uint8_t mac[MAC_LEN]);
 void mac_table_remove_port(mac_table_t *table, int port_id);
 
 /*
+ * Dumps all learned MAC entries to the specified file path.
+ * Returns 0 on success, -1 on error.
+ */
+int mac_table_dump(mac_table_t *table, const char *filepath);
+
+/*
  * Cleans up all entries, stops aging thread, and frees resources.
  */
 void mac_table_destroy(mac_table_t *table);

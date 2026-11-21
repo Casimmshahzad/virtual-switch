@@ -308,6 +308,39 @@ void mac_table_remove_port(mac_table_t *table, int port_id) {
     atomic_store_explicit(&table->port_mac_count[port_id], 0, memory_order_relaxed);
 }
 
+int mac_table_dump(mac_table_t *table, const char *filepath) {
+    if (!table || !filepath) {
+        return -1;
+    }
+
+    FILE *f = fopen(filepath, "w");
+    if (!f) {
+        perror("fopen mac_dump.txt");
+        return -1;
+    }
+
+    time_t now = time(NULL);
+    fprintf(f, "# MAC Table Dump\n");
+    fprintf(f, "# Total entries: %d\n", atomic_load_explicit(&table->total_entries, memory_order_relaxed));
+    fprintf(f, "# %-17s  %-5s  %-8s\n", "MAC Address", "Port", "Idle(s)");
+
+    for (int b = 0; b < MAC_TABLE_BUCKETS; b++) {
+        pthread_mutex_lock(&table->buckets[b].lock);
+        mac_entry_t *entry = table->buckets[b].head;
+        while (entry) {
+            char mac_str[MAC_STR_LEN];
+            mac_to_str(entry->mac, mac_str, sizeof(mac_str));
+            long idle = (long)(now - entry->last_seen);
+            fprintf(f, "%-17s  %-5d  %ld\n", mac_str, entry->port_id, idle);
+            entry = entry->next;
+        }
+        pthread_mutex_unlock(&table->buckets[b].lock);
+    }
+
+    fclose(f);
+    return 0;
+}
+
 void mac_table_destroy(mac_table_t *table) {
     if (!table) {
         return;

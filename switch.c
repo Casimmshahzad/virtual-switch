@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdatomic.h>
 #include <poll.h>
 #include <stdbool.h>
@@ -68,7 +69,7 @@ typedef enum {
 
 typedef struct {
     int id;
-    int fd;
+    _Atomic int fd;
     _Atomic int state;
     _Atomic bool rx_done;
     _Atomic bool tx_done;
@@ -92,13 +93,8 @@ static _Atomic int g_running = 1;
 static int g_num_ports = 0;
 static port_t *g_ports = NULL;
 static mac_table_t *g_mac_table = NULL;
-
-static void handle_signal(int sig) {
-    (void)sig;
-    int saved_errno = errno;
-    atomic_store_explicit(&g_running, 0, memory_order_relaxed);
-    errno = saved_errno;
-}
+static sem_t g_port_sem;
+static _Atomic int g_listen_fd = -1;
 
 /*
  * Drains any remaining queued shared frames and decrements their refcounts.
@@ -206,6 +202,7 @@ static void *port_tx_thread(void *arg) {
     atomic_store_explicit(&port->tx_done, true, memory_order_release);
     if (atomic_load_explicit(&port->rx_done, memory_order_acquire)) {
         atomic_store_explicit(&port->state, PORT_STATE_TERMINATED, memory_order_release);
+        sem_post(&g_port_sem);
     }
     return NULL;
 }
@@ -312,6 +309,7 @@ static void *port_rx_thread(void *arg) {
     atomic_store_explicit(&port->rx_done, true, memory_order_release);
     if (atomic_load_explicit(&port->tx_done, memory_order_acquire)) {
         atomic_store_explicit(&port->state, PORT_STATE_TERMINATED, memory_order_release);
+        sem_post(&g_port_sem);
     }
     return NULL;
 }
@@ -331,14 +329,8 @@ static void reap_terminated_ports(void) {
                 fprintf(stderr, "pthread_join tx_tid failed: %s\n", strerror(err));
             }
 
-            if (g_ports[i].fd >= 0) {
-                if (close(g_ports[i].fd) < 0) {
-                    perror("close port fd");
-                }
-                g_ports[i].fd = -1;
-            }
-
             pthread_mutex_lock(&g_ports[i].queue_mutex);
+            int fd = atomic_exchange_explicit(&g_ports[i].fd, -1, memory_order_relaxed);
             port_drain_queue_locked(&g_ports[i]);
             g_ports[i].queue_head = 0;
             g_ports[i].queue_tail = 0;
@@ -346,8 +338,11 @@ static void reap_terminated_ports(void) {
             atomic_store_explicit(&g_ports[i].state, PORT_STATE_FREE, memory_order_relaxed);
             pthread_mutex_unlock(&g_ports[i].queue_mutex);
 
-            /* Flush MAC entries learned on this port */
-            mac_table_remove_port(g_mac_table, i);
+            if (fd >= 0) {
+                if (close(fd) < 0) {
+                    perror("close port fd");
+                }
+            }
 
             printf("[Switch] Port %d: Reaped and reset to free\n", i);
             fflush(stdout);
@@ -403,6 +398,114 @@ static int allocate_port(int client_fd) {
     return -1;
 }
 
+/*
+ * Reloads switch configuration from config file on SIGHUP.
+ */
+static void reload_config(const char *filename) {
+    FILE *f = fopen(filename, "r");
+    if (!f) {
+        printf("[Config] Note: %s not found (retaining current settings)\n", filename);
+        fflush(stdout);
+        return;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\0') continue;
+
+        char key[64], val[64];
+        if (sscanf(p, "%63[^= ] = %63s", key, val) == 2 ||
+            sscanf(p, "%63[^= ]=%63s", key, val) == 2) {
+            if (strcmp(key, "aging_time") == 0) {
+                int t = atoi(val);
+                if (t > 0 && g_mac_table) {
+                    g_mac_table->aging_seconds = t;
+                    printf("[Config] Reloaded: aging_time = %d seconds\n", t);
+                }
+            } else if (strcmp(key, "mac_limit") == 0) {
+                int m = atoi(val);
+                if (m > 0 && g_mac_table) {
+                    g_mac_table->max_per_port = m;
+                    printf("[Config] Reloaded: mac_limit = %d per port\n", m);
+                }
+            }
+        }
+    }
+    fclose(f);
+    printf("[Config] %s reloaded successfully\n", filename);
+    fflush(stdout);
+}
+
+/*
+ * Dedicated signal thread handling SIGINT, SIGTERM, SIGHUP, and SIGUSR1 via sigwait.
+ * All other threads block these signals.
+ */
+static void *signal_thread(void *arg) {
+    (void)arg;
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGHUP);
+    sigaddset(&set, SIGUSR1);
+
+    while (atomic_load_explicit(&g_running, memory_order_relaxed)) {
+        int sig = 0;
+        int err = sigwait(&set, &sig);
+        if (err != 0) {
+            if (err == EINTR) continue;
+            break;
+        }
+
+        if (sig == SIGINT || sig == SIGTERM) {
+            printf("\n[Switch] Signal %d (%s) received: initiating clean shutdown\n",
+                   sig, (sig == SIGINT) ? "SIGINT" : "SIGTERM");
+            fflush(stdout);
+
+            atomic_store_explicit(&g_running, 0, memory_order_relaxed);
+
+            /* Unblock any connection waiting on sem_timedwait */
+            sem_post(&g_port_sem);
+
+            /* Unblock aging thread */
+            if (g_mac_table) {
+                atomic_store_explicit(&g_mac_table->running, false, memory_order_relaxed);
+                pthread_mutex_lock(&g_mac_table->aging_mutex);
+                pthread_cond_broadcast(&g_mac_table->aging_cond);
+                pthread_mutex_unlock(&g_mac_table->aging_mutex);
+            }
+
+            /* Unblock active port queues and sockets */
+            for (int i = 0; i < g_num_ports; i++) {
+                int st = atomic_load_explicit(&g_ports[i].state, memory_order_relaxed);
+                if (st == PORT_STATE_ACTIVE) {
+                    pthread_mutex_lock(&g_ports[i].queue_mutex);
+                    atomic_store_explicit(&g_ports[i].state, PORT_STATE_CLOSING, memory_order_relaxed);
+                    pthread_cond_broadcast(&g_ports[i].queue_cond);
+                    int fd = atomic_load_explicit(&g_ports[i].fd, memory_order_relaxed);
+                    pthread_mutex_unlock(&g_ports[i].queue_mutex);
+                    if (fd >= 0) {
+                        shutdown(fd, SHUT_RDWR);
+                    }
+                }
+            }
+            break;
+        } else if (sig == SIGHUP) {
+            printf("[Switch] SIGHUP received: reloading switch.conf\n");
+            fflush(stdout);
+            reload_config("switch.conf");
+        } else if (sig == SIGUSR1) {
+            printf("[Switch] SIGUSR1 received: dumping MAC table to mac_dump.txt\n");
+            fflush(stdout);
+            if (g_mac_table) {
+                mac_table_dump(g_mac_table, "mac_dump.txt");
+            }
+        }
+    }
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 3) {
         fprintf(stderr, "Usage: %s <tcp_port> <num_ports>\n", argv[0]);
@@ -419,6 +522,36 @@ int main(int argc, char *argv[]) {
     long num_ports = strtol(argv[2], &endptr, 10);
     if (*endptr != '\0' || num_ports <= 0 || num_ports > MAX_SWITCH_PORTS) {
         fprintf(stderr, "Error: Invalid num_ports: %s (max %d)\n", argv[2], MAX_SWITCH_PORTS);
+        return 1;
+    }
+
+    /*
+     * Block signals in main thread before spawning any threads.
+     * All spawned threads inherit this signal mask.
+     */
+    sigset_t sig_mask;
+    sigemptyset(&sig_mask);
+    sigaddset(&sig_mask, SIGINT);
+    sigaddset(&sig_mask, SIGTERM);
+    sigaddset(&sig_mask, SIGHUP);
+    sigaddset(&sig_mask, SIGUSR1);
+    if (pthread_sigmask(SIG_BLOCK, &sig_mask, NULL) != 0) {
+        perror("pthread_sigmask");
+        return 1;
+    }
+
+    /* Ignore SIGPIPE so write() returns EPIPE on disconnected sockets */
+    struct sigaction sa_pipe;
+    memset(&sa_pipe, 0, sizeof(sa_pipe));
+    sa_pipe.sa_handler = SIG_IGN;
+    if (sigaction(SIGPIPE, &sa_pipe, NULL) < 0) {
+        perror("sigaction(SIGPIPE)");
+        return 1;
+    }
+
+    /* Initialize counting semaphore holding available ports */
+    if (sem_init(&g_port_sem, 0, (unsigned int)num_ports) < 0) {
+        perror("sem_init");
         return 1;
     }
 
@@ -468,27 +601,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Ignore SIGPIPE so write() returns EPIPE on disconnected sockets */
-    struct sigaction sa_pipe;
-    memset(&sa_pipe, 0, sizeof(sa_pipe));
-    sa_pipe.sa_handler = SIG_IGN;
-    if (sigaction(SIGPIPE, &sa_pipe, NULL) < 0) {
-        perror("sigaction(SIGPIPE)");
-        return 1;
-    }
-
-    /* Handle SIGINT/SIGTERM for graceful teardown */
-    struct sigaction sa_int;
-    memset(&sa_int, 0, sizeof(sa_int));
-    sa_int.sa_handler = handle_signal;
-    if (sigaction(SIGINT, &sa_int, NULL) < 0) {
-        perror("sigaction(SIGINT)");
-        return 1;
-    }
-    if (sigaction(SIGTERM, &sa_int, NULL) < 0) {
-        perror("sigaction(SIGTERM)");
-        return 1;
-    }
+    /* Load initial configuration if switch.conf exists */
+    reload_config("switch.conf");
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
@@ -521,7 +635,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("[Switch] Started on port %ld with %ld max ports\n", port, num_ports);
+    atomic_store_explicit(&g_listen_fd, listen_fd, memory_order_relaxed);
+
+    /* Spawn dedicated signal handler thread using sigwait */
+    pthread_t sig_tid;
+    int s_err = pthread_create(&sig_tid, NULL, signal_thread, NULL);
+    if (s_err != 0) {
+        fprintf(stderr, "pthread_create signal_thread failed: %s\n", strerror(s_err));
+        return 1;
+    }
+
+    printf("[Switch] Started on port %ld with %ld max ports (port limit semaphore active)\n",
+           port, num_ports);
     fflush(stdout);
 
     struct pollfd pfd;
@@ -533,6 +658,9 @@ int main(int argc, char *argv[]) {
         if (poll_rc < 0) {
             if (errno == EINTR) {
                 continue;
+            }
+            if (!atomic_load_explicit(&g_running, memory_order_relaxed)) {
+                break;
             }
             perror("poll");
             break;
@@ -557,18 +685,66 @@ int main(int argc, char *argv[]) {
                 break;
             }
 
+            /* Wait on counting semaphore for an available port (timeout 2s) */
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 2;
+
+            int s_rc = sem_timedwait(&g_port_sem, &ts);
+            if (s_rc < 0) {
+                if (errno == ETIMEDOUT) {
+                    printf("[Switch] Switch full: timed out waiting for free port\n");
+                    fflush(stdout);
+
+                    /* Send "switch full" reply frame before closing socket */
+                    frame_t full_frame;
+                    memset(&full_frame, 0, sizeof(full_frame));
+                    full_frame.length = 11;
+                    memcpy(full_frame.payload, "switch full", 11);
+                    write_frame(client_fd, &full_frame);
+
+                    close(client_fd);
+                    continue;
+                }
+                if (errno == EINTR) {
+                    if (!atomic_load_explicit(&g_running, memory_order_relaxed)) {
+                        close(client_fd);
+                        break;
+                    }
+                    continue;
+                }
+                perror("sem_timedwait");
+                close(client_fd);
+                continue;
+            }
+
+            if (!atomic_load_explicit(&g_running, memory_order_relaxed)) {
+                close(client_fd);
+                sem_post(&g_port_sem);
+                break;
+            }
+
             int port_id = allocate_port(client_fd);
             if (port_id < 0) {
-                fprintf(stderr, "[Switch] All %ld ports occupied: rejecting connection\n", num_ports);
+                fprintf(stderr, "[Switch] Allocation failed despite semaphore permit\n");
+                sem_post(&g_port_sem);
                 close(client_fd);
             }
         }
     }
 
-    printf("[Switch] Shutting down...\n");
-    if (close(listen_fd) < 0) {
-        perror("close listen_fd");
+    printf("[Switch] Teardown: waiting for signal thread and active ports...\n");
+    fflush(stdout);
+
+    /* Close listen socket if not already closed by signal thread */
+    int lfd = atomic_exchange_explicit(&g_listen_fd, -1, memory_order_relaxed);
+    if (lfd >= 0) {
+        shutdown(lfd, SHUT_RDWR);
+        close(lfd);
     }
+
+    /* Join signal thread */
+    pthread_join(sig_tid, NULL);
 
     /* Unblock all active sender threads and signal closing */
     for (int i = 0; i < g_num_ports; i++) {
@@ -584,7 +760,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Join all threads and release resources */
+    /* Join all port threads and release resources */
     for (int i = 0; i < g_num_ports; i++) {
         int st = atomic_load_explicit(&g_ports[i].state, memory_order_relaxed);
         if (st != PORT_STATE_FREE) {
@@ -596,11 +772,11 @@ int main(int argc, char *argv[]) {
             if (err != 0) {
                 fprintf(stderr, "pthread_join tx_tid failed: %s\n", strerror(err));
             }
-            if (g_ports[i].fd >= 0) {
-                if (close(g_ports[i].fd) < 0) {
+            int fd = atomic_exchange_explicit(&g_ports[i].fd, -1, memory_order_relaxed);
+            if (fd >= 0) {
+                if (close(fd) < 0) {
                     perror("close port fd");
                 }
-                g_ports[i].fd = -1;
             }
         }
 
@@ -614,6 +790,10 @@ int main(int argc, char *argv[]) {
 
     mac_table_destroy(g_mac_table);
     free(g_mac_table);
+    sem_destroy(&g_port_sem);
     free(g_ports);
+
+    printf("[Switch] Teardown complete. All resources freed.\n");
+    fflush(stdout);
     return 0;
 }
