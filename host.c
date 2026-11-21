@@ -143,6 +143,49 @@ int main(int argc, char *argv[]) {
     printf("[Host %s] Connected to switch at %s:%ld\n", host_mac_str, switch_ip, port);
     fflush(stdout);
 
+    /* Test mode: one-shot priority send */
+    if (argc >= 7 && strcmp(argv[4], "--prio") == 0) {
+        int prio = atoi(argv[5]);
+        if (prio < 0 || prio > 2) {
+            fprintf(stderr, "Error: Invalid priority: %s (must be 0, 1, or 2)\n", argv[5]);
+            close(sock_fd);
+            return 1;
+        }
+        uint8_t dst_mac[MAC_LEN];
+        if (mac_from_str(argv[6], dst_mac) < 0) {
+            fprintf(stderr, "Error: Invalid dst_mac: %s\n", argv[6]);
+            close(sock_fd);
+            return 1;
+        }
+        const char *payload = (argc >= 8) ? argv[7] : "";
+        size_t p_len = strlen(payload);
+        if (p_len > MAX_PAYLOAD_LEN) p_len = MAX_PAYLOAD_LEN;
+
+        frame_t tx_frame;
+        memset(&tx_frame, 0, sizeof(tx_frame));
+        tx_frame.length = (uint16_t)p_len;
+        memcpy(tx_frame.src, host_mac, MAC_LEN);
+        memcpy(tx_frame.dst, dst_mac, MAC_LEN);
+        tx_frame.vlan = 1;
+        tx_frame.priority = (uint8_t)prio;
+        memcpy(tx_frame.payload, payload, p_len);
+
+        if (write_frame(sock_fd, &tx_frame) < 0) {
+            perror("write_frame");
+            close(sock_fd);
+            return 1;
+        }
+        printf("[Host %s] TX: prio=%d dst=%s len=%u payload='%.*s'\n",
+               host_mac_str, prio, argv[6], (unsigned int)p_len, (int)p_len, payload);
+        fflush(stdout);
+
+        if (close(sock_fd) < 0) {
+            perror("close sock_fd");
+            return 1;
+        }
+        return 0;
+    }
+
     /* Test mode: frozen host that never reads from socket */
     if (argc >= 5 && strcmp(argv[4], "--no-read") == 0) {
         /* Restrict receive buffer so TCP window fills quickly */
@@ -312,9 +355,22 @@ int main(int argc, char *argv[]) {
         uint8_t tx_src[MAC_LEN];
         uint8_t tx_dst[MAC_LEN];
         memcpy(tx_src, host_mac, MAC_LEN);
+        uint8_t frame_prio = PRIORITY_NORMAL;
 
+        char prio_str[16];
         char spoof_src[64], spoof_dst[64];
-        if (sscanf(line, "spoof %63s %63s %1500[^\n]", spoof_src, spoof_dst, payload_str) >= 2) {
+        if (sscanf(line, "prio %15s %63s %1500[^\n]", prio_str, dst_str, payload_str) >= 2) {
+            int p = atoi(prio_str);
+            if (p < 0 || p > 2) {
+                fprintf(stderr, "Error: Invalid priority (must be 0, 1, or 2)\n");
+                continue;
+            }
+            frame_prio = (uint8_t)p;
+            if (mac_from_str(dst_str, tx_dst) < 0) {
+                fprintf(stderr, "Error: Invalid destination MAC: %s\n", dst_str);
+                continue;
+            }
+        } else if (sscanf(line, "spoof %63s %63s %1500[^\n]", spoof_src, spoof_dst, payload_str) >= 2) {
             if (mac_from_str(spoof_src, tx_src) < 0 || mac_from_str(spoof_dst, tx_dst) < 0) {
                 fprintf(stderr, "Error: Invalid spoof MAC format\n");
                 continue;
@@ -334,7 +390,7 @@ int main(int argc, char *argv[]) {
         memcpy(tx_frame.src, tx_src, MAC_LEN);
         memcpy(tx_frame.dst, tx_dst, MAC_LEN);
         tx_frame.vlan = 1;
-        tx_frame.priority = PRIORITY_NORMAL;
+        tx_frame.priority = frame_prio;
         memcpy(tx_frame.payload, payload_str, tx_frame.length);
 
         if (write_frame(sock_fd, &tx_frame) < 0) {

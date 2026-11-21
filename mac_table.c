@@ -95,7 +95,7 @@ static void *mac_table_aging_thread(void *arg) {
             mac_entry_t **pcurr = &table->buckets[b].head;
             while (*pcurr) {
                 mac_entry_t *entry = *pcurr;
-                if (now - entry->last_seen >= table->aging_seconds) {
+                if (now - entry->last_seen >= atomic_load_explicit(&table->aging_seconds, memory_order_relaxed)) {
                     *pcurr = entry->next;
                     atomic_fetch_sub_explicit(&table->port_mac_count[entry->port_id], 1, memory_order_relaxed);
                     atomic_fetch_sub_explicit(&table->total_entries, 1, memory_order_relaxed);
@@ -123,8 +123,8 @@ int mac_table_init(mac_table_t *table, int max_entries_k, int max_per_port_m, in
     }
 
     table->max_entries = (max_entries_k > 0) ? max_entries_k : 1024;
-    table->max_per_port = (max_per_port_m > 0) ? max_per_port_m : 16;
-    table->aging_seconds = (aging_time_t > 0) ? aging_time_t : 30;
+    atomic_init(&table->max_per_port, (max_per_port_m > 0) ? max_per_port_m : 16);
+    atomic_init(&table->aging_seconds, (aging_time_t > 0) ? aging_time_t : 30);
 
     atomic_init(&table->total_entries, 0);
     for (int i = 0; i < MAX_SWITCH_PORTS; i++) {
@@ -208,10 +208,11 @@ int mac_table_learn(mac_table_t *table, const uint8_t mac[MAC_LEN], int port_id)
     }
 
     /* New MAC: enforce port security limit M */
-    if (atomic_load_explicit(&table->port_mac_count[port_id], memory_order_relaxed) >= table->max_per_port) {
+    int limit = atomic_load_explicit(&table->max_per_port, memory_order_relaxed);
+    if (atomic_load_explicit(&table->port_mac_count[port_id], memory_order_relaxed) >= limit) {
         pthread_mutex_unlock(&table->buckets[b].lock);
         printf("[Port Security] Port %d exceeded limit of %d MACs: shutting down port!\n",
-               port_id, table->max_per_port);
+               port_id, limit);
         fflush(stdout);
         return MAC_TABLE_SECURITY_VIOLATION;
     }

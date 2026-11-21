@@ -31,8 +31,8 @@ typedef struct {
 typedef struct {
     mac_bucket_t buckets[MAC_TABLE_BUCKETS];
     int max_entries;                       /* Global capacity K */
-    int max_per_port;                      /* Port security limit M */
-    int aging_seconds;                     /* Aging timeout T */
+    _Atomic int max_per_port;              /* Port security limit M */
+    _Atomic int aging_seconds;             /* Aging timeout T */
     _Atomic int total_entries;
     _Atomic int port_mac_count[MAX_SWITCH_PORTS];
 
