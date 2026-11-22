@@ -347,6 +347,39 @@ int mac_table_dump(mac_table_t *table, const char *filepath) {
     return 0;
 }
 
+void mac_table_clear(mac_table_t *table) {
+    if (!table) {
+        return;
+    }
+
+    /* Acquire all bucket locks in increasing order (0..63) per hierarchy */
+    for (int b = 0; b < MAC_TABLE_BUCKETS; b++) {
+        pthread_mutex_lock(&table->buckets[b].lock);
+    }
+
+    for (int b = 0; b < MAC_TABLE_BUCKETS; b++) {
+        mac_entry_t *curr = table->buckets[b].head;
+        while (curr) {
+            mac_entry_t *next = curr->next;
+            free(curr);
+            curr = next;
+        }
+        table->buckets[b].head = NULL;
+    }
+
+    for (int i = 0; i < MAX_SWITCH_PORTS; i++) {
+        atomic_store_explicit(&table->port_mac_count[i], 0, memory_order_relaxed);
+    }
+    atomic_store_explicit(&table->total_entries, 0, memory_order_relaxed);
+
+    /* Release bucket locks in increasing order */
+    for (int b = 0; b < MAC_TABLE_BUCKETS; b++) {
+        pthread_mutex_unlock(&table->buckets[b].lock);
+    }
+    printf("[MAC Table] All MAC entries cleared by admin\n");
+    fflush(stdout);
+}
+
 void mac_table_destroy(mac_table_t *table) {
     if (!table) {
         return;

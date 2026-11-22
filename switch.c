@@ -1,5 +1,6 @@
 #include "protocol.h"
 #include "mac_table.h"
+#include "shm_stats.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,8 +13,12 @@
 #include <poll.h>
 #include <stdbool.h>
 #include <time.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -107,6 +112,10 @@ typedef struct {
     _Atomic bool is_trunk;     /* True if port is a trunk carrying all VLANs */
     _Atomic int mirror_dest;   /* Target sniffer port ID, or -1 if disabled */
 
+    /* Live Reconfiguration & Admin Status (Milestone 7) */
+    _Atomic bool is_admin_down;
+    _Atomic uint64_t frames_mirrored;
+
     _Atomic uint64_t frames_in;
     _Atomic uint64_t frames_out;
     _Atomic uint64_t frames_dropped;
@@ -118,6 +127,248 @@ static port_t *g_ports = NULL;
 static mac_table_t *g_mac_table = NULL;
 static sem_t g_port_sem;
 static _Atomic int g_listen_fd = -1;
+
+/* Lock Hierarchy: port_table_lock -> port_lock[lowest..highest] -> mac_bucket_lock[lowest..highest] -> shm_stats_lock */
+static pthread_mutex_t g_port_table_mutex = PTHREAD_MUTEX_INITIALIZER;
+static switch_shm_t *g_shm = NULL;
+static pthread_t g_admin_tid;
+static _Atomic int g_admin_sock_fd = -1;
+
+/* Helper to synchronize a single port's state/stats into shared memory */
+static void shm_update_port(int port_id) {
+    if (!g_shm || port_id < 0 || port_id >= g_num_ports) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_shm->lock);
+    port_t *p = &g_ports[port_id];
+    g_shm->ports[port_id].port_id = port_id;
+    g_shm->ports[port_id].is_active = (atomic_load_explicit(&p->state, memory_order_relaxed) == PORT_STATE_ACTIVE);
+    g_shm->ports[port_id].is_admin_down = atomic_load_explicit(&p->is_admin_down, memory_order_relaxed);
+    g_shm->ports[port_id].vlan = atomic_load_explicit(&p->vlan_id, memory_order_relaxed);
+    g_shm->ports[port_id].is_trunk = atomic_load_explicit(&p->is_trunk, memory_order_relaxed);
+    g_shm->ports[port_id].mirror_dest = atomic_load_explicit(&p->mirror_dest, memory_order_relaxed);
+    g_shm->ports[port_id].frames_in = atomic_load_explicit(&p->frames_in, memory_order_relaxed);
+    g_shm->ports[port_id].frames_out = atomic_load_explicit(&p->frames_out, memory_order_relaxed);
+    g_shm->ports[port_id].frames_dropped = atomic_load_explicit(&p->frames_dropped, memory_order_relaxed);
+    g_shm->ports[port_id].frames_mirrored = atomic_load_explicit(&p->frames_mirrored, memory_order_relaxed);
+    pthread_mutex_unlock(&g_shm->lock);
+}
+
+/*
+ * Admin thread: listens on UNIX domain socket /tmp/switch.sock.
+ * Handles commands: show mac, show ports, shutdown <port>, up <port>,
+ *                   vlan <port> <vlan>, mirror <port> <sniffer>, clear mac.
+ * Lock order respected: g_port_table_mutex -> port queue_mutex (avoided here) -> shm lock.
+ */
+static void admin_send(int fd, const char *msg) {
+    size_t len = strlen(msg);
+    size_t written = 0;
+    while (written < len) {
+        ssize_t n = write(fd, msg + written, len - written);
+        if (n <= 0) break;
+        written += (size_t)n;
+    }
+}
+
+static void *admin_thread(void *arg) {
+    (void)arg;
+
+    /* Create UNIX domain socket */
+    unlink(UNIX_SOCKET_PATH);
+    int srv_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srv_fd < 0) {
+        perror("[Admin] socket");
+        return NULL;
+    }
+    atomic_store_explicit(&g_admin_sock_fd, srv_fd, memory_order_relaxed);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, UNIX_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+    if (bind(srv_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("[Admin] bind");
+        close(srv_fd);
+        return NULL;
+    }
+    if (listen(srv_fd, 8) < 0) {
+        perror("[Admin] listen");
+        close(srv_fd);
+        return NULL;
+    }
+
+    printf("[Admin] Listening on %s\n", UNIX_SOCKET_PATH);
+    fflush(stdout);
+
+    while (atomic_load_explicit(&g_running, memory_order_relaxed)) {
+        struct pollfd pfd;
+        pfd.fd = srv_fd;
+        pfd.events = POLLIN;
+        int rc = poll(&pfd, 1, 300);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (rc == 0) continue;
+        if (!(pfd.revents & POLLIN)) continue;
+
+        int cfd = accept(srv_fd, NULL, NULL);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            if (!atomic_load_explicit(&g_running, memory_order_relaxed)) break;
+            perror("[Admin] accept");
+            continue;
+        }
+
+        /* Read command line (up to 512 bytes, terminated by newline) */
+        char buf[512];
+        memset(buf, 0, sizeof(buf));
+        ssize_t n = read(cfd, buf, sizeof(buf) - 1);
+        if (n <= 0) {
+            close(cfd);
+            continue;
+        }
+        /* Strip trailing newline/CR */
+        for (int i = (int)n - 1; i >= 0 && (buf[i] == '\n' || buf[i] == '\r'); i--) {
+            buf[i] = '\0';
+        }
+
+        char reply[8192];
+        reply[0] = '\0';
+
+        /* ---- Command dispatch ---- */
+        if (strcmp(buf, "show mac") == 0) {
+            /* Dump MAC table to a temp file, read it back */
+            const char *tmp = "/tmp/swctl_mac_dump.txt";
+            if (g_mac_table && mac_table_dump(g_mac_table, tmp) == 0) {
+                FILE *f = fopen(tmp, "r");
+                if (f) {
+                    size_t off = 0;
+                    while (off < sizeof(reply) - 1) {
+                        size_t r2 = fread(reply + off, 1, sizeof(reply) - 1 - off, f);
+                        if (r2 == 0) break;
+                        off += r2;
+                    }
+                    reply[off] = '\0';
+                    fclose(f);
+                    unlink(tmp);
+                } else {
+                    snprintf(reply, sizeof(reply), "ERROR: cannot open mac dump\n");
+                }
+            } else {
+                snprintf(reply, sizeof(reply), "ERROR: mac_table_dump failed\n");
+            }
+
+        } else if (strcmp(buf, "show ports") == 0) {
+            char line[256];
+            snprintf(reply, sizeof(reply),
+                     "%-5s  %-6s  %-5s  %-6s  %-6s  %-10s  %-10s  %-10s  %-10s  %-8s\n",
+                     "PORT", "STATE", "VLAN", "TRUNK", "ADMIN",
+                     "RX", "TX", "DROPPED", "MIRRORED", "MIRROR");
+            pthread_mutex_lock(&g_port_table_mutex);
+            for (int i = 0; i < g_num_ports; i++) {
+                port_t *p = &g_ports[i];
+                int st = atomic_load_explicit(&p->state, memory_order_relaxed);
+                const char *state_str = (st == PORT_STATE_ACTIVE) ? "ACTIVE" :
+                                        (st == PORT_STATE_CLOSING) ? "CLOSING" :
+                                        (st == PORT_STATE_TERMINATED) ? "TERM" : "FREE";
+                bool admin_down = atomic_load_explicit(&p->is_admin_down, memory_order_relaxed);
+                bool is_trunk   = atomic_load_explicit(&p->is_trunk, memory_order_relaxed);
+                uint16_t vlan   = atomic_load_explicit(&p->vlan_id, memory_order_relaxed);
+                int mirror      = atomic_load_explicit(&p->mirror_dest, memory_order_relaxed);
+                uint64_t fin    = atomic_load_explicit(&p->frames_in, memory_order_relaxed);
+                uint64_t fout   = atomic_load_explicit(&p->frames_out, memory_order_relaxed);
+                uint64_t fdrop  = atomic_load_explicit(&p->frames_dropped, memory_order_relaxed);
+                uint64_t fmir   = atomic_load_explicit(&p->frames_mirrored, memory_order_relaxed);
+                char mirror_str[16];
+                if (mirror >= 0)
+                    snprintf(mirror_str, sizeof(mirror_str), "->%d", mirror);
+                else
+                    strncpy(mirror_str, "none", sizeof(mirror_str));
+                snprintf(line, sizeof(line),
+                         "%-5d  %-6s  %-5u  %-6s  %-6s  %-10lu  %-10lu  %-10lu  %-10lu  %-8s\n",
+                         i, state_str, vlan, is_trunk ? "yes" : "no",
+                         admin_down ? "DOWN" : "UP",
+                         (unsigned long)fin, (unsigned long)fout,
+                         (unsigned long)fdrop, (unsigned long)fmir, mirror_str);
+                strncat(reply, line, sizeof(reply) - strlen(reply) - 1);
+            }
+            pthread_mutex_unlock(&g_port_table_mutex);
+
+        } else if (strncmp(buf, "shutdown ", 9) == 0) {
+            int pid = atoi(buf + 9);
+            if (pid < 0 || pid >= g_num_ports) {
+                snprintf(reply, sizeof(reply), "ERROR: invalid port %d\n", pid);
+            } else {
+                atomic_store_explicit(&g_ports[pid].is_admin_down, true, memory_order_relaxed);
+                shm_update_port(pid);
+                snprintf(reply, sizeof(reply), "OK: port %d administratively down\n", pid);
+                printf("[Admin] Port %d set admin-down\n", pid);
+                fflush(stdout);
+            }
+
+        } else if (strncmp(buf, "up ", 3) == 0) {
+            int pid = atoi(buf + 3);
+            if (pid < 0 || pid >= g_num_ports) {
+                snprintf(reply, sizeof(reply), "ERROR: invalid port %d\n", pid);
+            } else {
+                atomic_store_explicit(&g_ports[pid].is_admin_down, false, memory_order_relaxed);
+                shm_update_port(pid);
+                snprintf(reply, sizeof(reply), "OK: port %d administratively up\n", pid);
+                printf("[Admin] Port %d set admin-up\n", pid);
+                fflush(stdout);
+            }
+
+        } else if (strncmp(buf, "vlan ", 5) == 0) {
+            int pid = -1, vid = -1;
+            if (sscanf(buf + 5, "%d %d", &pid, &vid) != 2 ||
+                pid < 0 || pid >= g_num_ports || vid < 1 || vid > 4094) {
+                snprintf(reply, sizeof(reply), "ERROR: usage: vlan <port> <vlan_id>\n");
+            } else {
+                atomic_store_explicit(&g_ports[pid].vlan_id, (uint16_t)vid, memory_order_relaxed);
+                shm_update_port(pid);
+                snprintf(reply, sizeof(reply), "OK: port %d VLAN set to %d\n", pid, vid);
+                printf("[Admin] Port %d VLAN -> %d\n", pid, vid);
+                fflush(stdout);
+            }
+
+        } else if (strncmp(buf, "mirror ", 7) == 0) {
+            int src = -1, dst = -1;
+            if (sscanf(buf + 7, "%d %d", &src, &dst) != 2 ||
+                src < 0 || src >= g_num_ports || dst < 0 || dst >= g_num_ports || src == dst) {
+                snprintf(reply, sizeof(reply), "ERROR: usage: mirror <port> <sniffer_port>\n");
+            } else {
+                atomic_store_explicit(&g_ports[src].mirror_dest, dst, memory_order_relaxed);
+                shm_update_port(src);
+                snprintf(reply, sizeof(reply), "OK: port %d mirrored to port %d\n", src, dst);
+                printf("[Admin] Mirror port %d -> port %d\n", src, dst);
+                fflush(stdout);
+            }
+
+        } else if (strcmp(buf, "clear mac") == 0) {
+            if (g_mac_table) {
+                mac_table_clear(g_mac_table);
+                snprintf(reply, sizeof(reply), "OK: MAC table cleared\n");
+            } else {
+                snprintf(reply, sizeof(reply), "ERROR: MAC table not initialized\n");
+            }
+
+        } else {
+            snprintf(reply, sizeof(reply), "ERROR: unknown command: %s\n", buf);
+        }
+
+        admin_send(cfd, reply);
+        shutdown(cfd, SHUT_WR);
+        close(cfd);
+    }
+
+    int sfd = atomic_exchange_explicit(&g_admin_sock_fd, -1, memory_order_relaxed);
+    if (sfd >= 0) close(sfd);
+    unlink(UNIX_SOCKET_PATH);
+    return NULL;
+}
 
 /* Rate limiter timer thread state */
 static _Atomic int g_default_rate_limit = DEFAULT_RATE_LIMIT;
@@ -164,6 +415,11 @@ static int port_enqueue(port_t *port, shared_frame_t *sf) {
     if (port->q_count[prio] >= PORT_QUEUE_CAPACITY) {
         atomic_fetch_add_explicit(&port->frames_dropped, 1, memory_order_relaxed);
         uint64_t drops = atomic_load_explicit(&port->frames_dropped, memory_order_relaxed);
+        if (g_shm) {
+            pthread_mutex_lock(&g_shm->lock);
+            g_shm->ports[port->id].frames_dropped++;
+            pthread_mutex_unlock(&g_shm->lock);
+        }
         pthread_mutex_unlock(&port->queue_mutex);
         printf("[Switch] Port %d: Priority %d queue full, dropped frame (total dropped: %lu)\n",
                port->id, prio, (unsigned long)drops);
@@ -375,6 +631,11 @@ static void *port_tx_thread(void *arg) {
                 break;
             } else {
                 atomic_fetch_add_explicit(&port->frames_out, 1, memory_order_relaxed);
+                if (g_shm) {
+                    pthread_mutex_lock(&g_shm->lock);
+                    g_shm->ports[port->id].frames_out++;
+                    pthread_mutex_unlock(&g_shm->lock);
+                }
             }
 
             shared_frame_release(sf);
@@ -423,6 +684,11 @@ static void *port_rx_thread(void *arg) {
         }
 
         atomic_fetch_add_explicit(&port->frames_in, 1, memory_order_relaxed);
+        if (g_shm) {
+            pthread_mutex_lock(&g_shm->lock);
+            g_shm->ports[port->id].frames_in++;
+            pthread_mutex_unlock(&g_shm->lock);
+        }
 
         bool is_trunk = atomic_load_explicit(&port->is_trunk, memory_order_relaxed);
         uint16_t port_vlan = atomic_load_explicit(&port->vlan_id, memory_order_relaxed);
@@ -468,11 +734,29 @@ static void *port_rx_thread(void *arg) {
             continue;
         }
 
+        /* Drop frames on admin-downed ports */
+        if (atomic_load_explicit(&port->is_admin_down, memory_order_relaxed)) {
+            atomic_fetch_add_explicit(&port->frames_dropped, 1, memory_order_relaxed);
+            if (g_shm) {
+                pthread_mutex_lock(&g_shm->lock);
+                g_shm->ports[port->id].frames_dropped++;
+                pthread_mutex_unlock(&g_shm->lock);
+            }
+            shared_frame_release(sf);
+            continue;
+        }
+
         /* Port Mirroring: clone ingress frame to sniffer port without blocking */
         int sniffer = atomic_load_explicit(&port->mirror_dest, memory_order_relaxed);
         if (sniffer >= 0 && sniffer < g_num_ports && sniffer != port->id) {
             if (atomic_load_explicit(&g_ports[sniffer].state, memory_order_relaxed) == PORT_STATE_ACTIVE) {
                 if (port_enqueue(&g_ports[sniffer], sf) == 0) {
+                    atomic_fetch_add_explicit(&port->frames_mirrored, 1, memory_order_relaxed);
+                    if (g_shm) {
+                        pthread_mutex_lock(&g_shm->lock);
+                        g_shm->ports[port->id].frames_mirrored++;
+                        pthread_mutex_unlock(&g_shm->lock);
+                    }
                     printf("[Mirror] Cloned frame from port %d to sniffer port %d\n", port->id, sniffer);
                     fflush(stdout);
                 }
@@ -952,6 +1236,9 @@ int main(int argc, char *argv[]) {
         atomic_init(&g_ports[i].is_trunk, false);
         atomic_init(&g_ports[i].mirror_dest, -1);
 
+        atomic_init(&g_ports[i].is_admin_down, false);
+        atomic_init(&g_ports[i].frames_mirrored, 0);
+
         atomic_init(&g_ports[i].frames_in, 0);
         atomic_init(&g_ports[i].frames_out, 0);
         atomic_init(&g_ports[i].frames_dropped, 0);
@@ -981,6 +1268,57 @@ int main(int argc, char *argv[]) {
 
     /* Load initial configuration if switch.conf exists */
     reload_config("switch.conf");
+
+    /* ---- Shared Memory Stats (Milestone 7) ---- */
+    shm_unlink(SHM_STATS_NAME); /* Clean up any stale mapping */
+    int shm_fd = shm_open(SHM_STATS_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd < 0) {
+        perror("shm_open");
+        return 1;
+    }
+    if (ftruncate(shm_fd, (off_t)sizeof(switch_shm_t)) < 0) {
+        perror("ftruncate shm");
+        shm_unlink(SHM_STATS_NAME);
+        close(shm_fd);
+        return 1;
+    }
+    g_shm = mmap(NULL, sizeof(switch_shm_t), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    close(shm_fd);
+    if (g_shm == MAP_FAILED) {
+        perror("mmap shm");
+        shm_unlink(SHM_STATS_NAME);
+        return 1;
+    }
+    memset(g_shm, 0, sizeof(switch_shm_t));
+
+    /* Initialize PROCESS_SHARED mutex for the shared memory region */
+    {
+        pthread_mutexattr_t mattr;
+        int ma_err = pthread_mutexattr_init(&mattr);
+        if (ma_err != 0) { fprintf(stderr, "pthread_mutexattr_init: %s\n", strerror(ma_err)); return 1; }
+        ma_err = pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
+        if (ma_err != 0) { fprintf(stderr, "pthread_mutexattr_setpshared: %s\n", strerror(ma_err)); return 1; }
+        ma_err = pthread_mutex_init(&g_shm->lock, &mattr);
+        if (ma_err != 0) { fprintf(stderr, "pthread_mutex_init shm: %s\n", strerror(ma_err)); return 1; }
+        pthread_mutexattr_destroy(&mattr);
+    }
+    g_shm->num_ports = g_num_ports;
+    /* Populate initial per-port data */
+    for (int i = 0; i < g_num_ports; i++) {
+        shm_update_port(i);
+    }
+    printf("[Switch] Shared memory stats at %s (%zu bytes)\n",
+           SHM_STATS_NAME, sizeof(switch_shm_t));
+    fflush(stdout);
+
+    /* Spawn admin UNIX socket thread */
+    {
+        int a_err = pthread_create(&g_admin_tid, NULL, admin_thread, NULL);
+        if (a_err != 0) {
+            fprintf(stderr, "pthread_create admin_thread: %s\n", strerror(a_err));
+            return 1;
+        }
+    }
 
     /* Initialize token bucket rate refill timer */
     pthread_mutex_init(&g_rate_timer_mutex, NULL);
@@ -1132,6 +1470,16 @@ int main(int argc, char *argv[]) {
     /* Join signal thread */
     pthread_join(sig_tid, NULL);
 
+    /* Stop admin thread: close its listen socket to unblock poll() */
+    {
+        int afd = atomic_exchange_explicit(&g_admin_sock_fd, -1, memory_order_relaxed);
+        if (afd >= 0) {
+            shutdown(afd, SHUT_RDWR);
+            close(afd);
+        }
+        pthread_join(g_admin_tid, NULL);
+    }
+
     /* Stop and join rate limiter timer thread */
     pthread_mutex_lock(&g_rate_timer_mutex);
     pthread_cond_broadcast(&g_rate_timer_cond);
@@ -1187,6 +1535,14 @@ int main(int argc, char *argv[]) {
     free(g_mac_table);
     sem_destroy(&g_port_sem);
     free(g_ports);
+
+    /* Unlink shared memory and unmap */
+    if (g_shm && g_shm != MAP_FAILED) {
+        pthread_mutex_destroy(&g_shm->lock);
+        munmap(g_shm, sizeof(switch_shm_t));
+        g_shm = NULL;
+    }
+    shm_unlink(SHM_STATS_NAME);
 
     printf("[Switch] Teardown complete. All resources freed.\n");
     fflush(stdout);

@@ -77,6 +77,12 @@ void mac_table_remove_port(mac_table_t *table, int port_id);
 int mac_table_dump(mac_table_t *table, const char *filepath);
 
 /*
+ * Clears all entries from the MAC table.
+ * Acquires all bucket locks in increasing order (0..63) per lock hierarchy.
+ */
+void mac_table_clear(mac_table_t *table);
+
+/*
  * Cleans up all entries, stops aging thread, and frees resources.
  */
 void mac_table_destroy(mac_table_t *table);
