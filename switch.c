@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -25,6 +26,149 @@
 #define NUM_PRIORITIES       3
 #define PORT_QUEUE_CAPACITY  32
 #define DEFAULT_RATE_LIMIT   100
+
+/* =========================================================
+ * Async Logger (Milestone 8)
+ * Thread-safe bounded ring buffer; dedicated logger thread
+ * writes timestamped entries to switch.log without blocking
+ * the RX/TX fast paths.
+ * Lock hierarchy position: taken independently (never nested
+ * under any port or SHM lock).
+ * ========================================================= */
+#define LOG_QUEUE_CAPACITY  512
+#define LOG_MSG_MAX         256
+#define LOG_FILE_PATH       "switch.log"
+
+typedef struct {
+    char msg[LOG_MSG_MAX];
+} log_entry_t;
+
+typedef struct {
+    log_entry_t  entries[LOG_QUEUE_CAPACITY];
+    int          head;
+    int          tail;
+    int          count;
+    pthread_mutex_t lock;
+    pthread_cond_t  not_empty;
+    pthread_cond_t  not_full;
+    bool         closed;   /* set to true on shutdown to wake logger */
+} log_queue_t;
+
+static log_queue_t g_log_queue;
+static pthread_t   g_logger_tid;
+static bool        g_logger_started = false;
+
+/* Enqueue a formatted message.  Called from any thread on the fast path.
+ * If the queue is full the message is silently dropped (no busy-wait). */
+static void async_log(const char *fmt, ...)
+    __attribute__((format(printf, 1, 2)));
+
+static void async_log(const char *fmt, ...) {
+    char buf[LOG_MSG_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    pthread_mutex_lock(&g_log_queue.lock);
+    if (!g_log_queue.closed && g_log_queue.count < LOG_QUEUE_CAPACITY) {
+        int t = g_log_queue.tail;
+        strncpy(g_log_queue.entries[t].msg, buf, LOG_MSG_MAX - 1);
+        g_log_queue.entries[t].msg[LOG_MSG_MAX - 1] = '\0';
+        g_log_queue.tail = (t + 1) % LOG_QUEUE_CAPACITY;
+        g_log_queue.count++;
+        pthread_cond_signal(&g_log_queue.not_empty);
+    }
+    pthread_mutex_unlock(&g_log_queue.lock);
+}
+
+/* Logger thread: dequeues entries and writes timestamped lines to switch.log */
+static void *logger_thread(void *arg) {
+    (void)arg;
+    FILE *f = fopen(LOG_FILE_PATH, "a");
+    if (!f) {
+        perror("[Logger] fopen switch.log");
+        return NULL;
+    }
+
+    while (1) {
+        pthread_mutex_lock(&g_log_queue.lock);
+        while (g_log_queue.count == 0 && !g_log_queue.closed) {
+            pthread_cond_wait(&g_log_queue.not_empty, &g_log_queue.lock);
+        }
+        if (g_log_queue.count == 0 && g_log_queue.closed) {
+            pthread_mutex_unlock(&g_log_queue.lock);
+            break;
+        }
+        /* Drain all queued entries while holding lock */
+        char batch[LOG_QUEUE_CAPACITY][LOG_MSG_MAX];
+        int n = 0;
+        while (g_log_queue.count > 0 && n < LOG_QUEUE_CAPACITY) {
+            strncpy(batch[n], g_log_queue.entries[g_log_queue.head].msg, LOG_MSG_MAX - 1);
+            batch[n][LOG_MSG_MAX - 1] = '\0';
+            g_log_queue.head = (g_log_queue.head + 1) % LOG_QUEUE_CAPACITY;
+            g_log_queue.count--;
+            n++;
+        }
+        pthread_cond_broadcast(&g_log_queue.not_full);
+        pthread_mutex_unlock(&g_log_queue.lock);
+
+        /* Write batch outside the lock */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        struct tm tm_buf;
+        localtime_r(&ts.tv_sec, &tm_buf);
+        char tstr[32];
+        strftime(tstr, sizeof(tstr), "%Y-%m-%d %H:%M:%S", &tm_buf);
+        for (int i = 0; i < n; i++) {
+            fprintf(f, "[%s.%03ld] %s\n", tstr,
+                    ts.tv_nsec / 1000000L, batch[i]);
+        }
+        fflush(f);
+    }
+
+    fclose(f);
+    return NULL;
+}
+
+/* Call once after mutex/cond are initialized; before any async_log() calls */
+static int logger_init(void) {
+    memset(&g_log_queue, 0, sizeof(g_log_queue));
+    int err = pthread_mutex_init(&g_log_queue.lock, NULL);
+    if (err != 0) return err;
+    err = pthread_cond_init(&g_log_queue.not_empty, NULL);
+    if (err != 0) { pthread_mutex_destroy(&g_log_queue.lock); return err; }
+    err = pthread_cond_init(&g_log_queue.not_full, NULL);
+    if (err != 0) {
+        pthread_cond_destroy(&g_log_queue.not_empty);
+        pthread_mutex_destroy(&g_log_queue.lock);
+        return err;
+    }
+    g_log_queue.closed = false;
+    err = pthread_create(&g_logger_tid, NULL, logger_thread, NULL);
+    if (err != 0) {
+        pthread_cond_destroy(&g_log_queue.not_full);
+        pthread_cond_destroy(&g_log_queue.not_empty);
+        pthread_mutex_destroy(&g_log_queue.lock);
+        return err;
+    }
+    g_logger_started = true;
+    return 0;
+}
+
+/* Signal logger to drain and exit, then join */
+static void logger_shutdown(void) {
+    if (!g_logger_started) return;
+    pthread_mutex_lock(&g_log_queue.lock);
+    g_log_queue.closed = true;
+    pthread_cond_signal(&g_log_queue.not_empty);
+    pthread_mutex_unlock(&g_log_queue.lock);
+    pthread_join(g_logger_tid, NULL);
+    pthread_cond_destroy(&g_log_queue.not_full);
+    pthread_cond_destroy(&g_log_queue.not_empty);
+    pthread_mutex_destroy(&g_log_queue.lock);
+    g_logger_started = false;
+}
 
 /*
  * Shared frame with thread-safe reference count.
@@ -199,8 +343,7 @@ static void *admin_thread(void *arg) {
         return NULL;
     }
 
-    printf("[Admin] Listening on %s\n", UNIX_SOCKET_PATH);
-    fflush(stdout);
+    async_log("[Admin] Listening on %s", UNIX_SOCKET_PATH);
 
     while (atomic_load_explicit(&g_running, memory_order_relaxed)) {
         struct pollfd pfd;
@@ -305,8 +448,7 @@ static void *admin_thread(void *arg) {
                 atomic_store_explicit(&g_ports[pid].is_admin_down, true, memory_order_relaxed);
                 shm_update_port(pid);
                 snprintf(reply, sizeof(reply), "OK: port %d administratively down\n", pid);
-                printf("[Admin] Port %d set admin-down\n", pid);
-                fflush(stdout);
+                async_log("[Admin] Port %d set admin-down", pid);
             }
 
         } else if (strncmp(buf, "up ", 3) == 0) {
@@ -317,8 +459,7 @@ static void *admin_thread(void *arg) {
                 atomic_store_explicit(&g_ports[pid].is_admin_down, false, memory_order_relaxed);
                 shm_update_port(pid);
                 snprintf(reply, sizeof(reply), "OK: port %d administratively up\n", pid);
-                printf("[Admin] Port %d set admin-up\n", pid);
-                fflush(stdout);
+                async_log("[Admin] Port %d set admin-up", pid);
             }
 
         } else if (strncmp(buf, "vlan ", 5) == 0) {
@@ -330,8 +471,7 @@ static void *admin_thread(void *arg) {
                 atomic_store_explicit(&g_ports[pid].vlan_id, (uint16_t)vid, memory_order_relaxed);
                 shm_update_port(pid);
                 snprintf(reply, sizeof(reply), "OK: port %d VLAN set to %d\n", pid, vid);
-                printf("[Admin] Port %d VLAN -> %d\n", pid, vid);
-                fflush(stdout);
+                async_log("[Admin] Port %d VLAN -> %d", pid, vid);
             }
 
         } else if (strncmp(buf, "mirror ", 7) == 0) {
@@ -343,8 +483,7 @@ static void *admin_thread(void *arg) {
                 atomic_store_explicit(&g_ports[src].mirror_dest, dst, memory_order_relaxed);
                 shm_update_port(src);
                 snprintf(reply, sizeof(reply), "OK: port %d mirrored to port %d\n", src, dst);
-                printf("[Admin] Mirror port %d -> port %d\n", src, dst);
-                fflush(stdout);
+                async_log("[Admin] Mirror port %d -> port %d", src, dst);
             }
 
         } else if (strcmp(buf, "clear mac") == 0) {
@@ -421,9 +560,8 @@ static int port_enqueue(port_t *port, shared_frame_t *sf) {
             pthread_mutex_unlock(&g_shm->lock);
         }
         pthread_mutex_unlock(&port->queue_mutex);
-        printf("[Switch] Port %d: Priority %d queue full, dropped frame (total dropped: %lu)\n",
+        async_log("[Switch] Port %d: Priority %d queue full, dropped frame (total dropped: %lu)",
                port->id, prio, (unsigned long)drops);
-        fflush(stdout);
         return -1;
     }
 
@@ -469,9 +607,8 @@ static void port_age_queues_locked(port_t *port) {
                 port->queues[PRIORITY_NORMAL][n_tail] = entry;
                 port->q_tail[PRIORITY_NORMAL] = (n_tail + 1) % PORT_QUEUE_CAPACITY;
                 port->q_count[PRIORITY_NORMAL]++;
-                printf("[QoS] Port %d: Aged frame (wait %ld ms) promoted Low -> Normal\n",
+                async_log("[QoS] Port %d: Aged frame (wait %ld ms) promoted Low -> Normal",
                        port->id, elapsed_ms);
-                fflush(stdout);
             } else {
                 break;
             }
@@ -497,9 +634,8 @@ static void port_age_queues_locked(port_t *port) {
                 port->queues[PRIORITY_HIGH][h_tail] = entry;
                 port->q_tail[PRIORITY_HIGH] = (h_tail + 1) % PORT_QUEUE_CAPACITY;
                 port->q_count[PRIORITY_HIGH]++;
-                printf("[QoS] Port %d: Aged frame (wait %ld ms) promoted Normal -> High\n",
+                async_log("[QoS] Port %d: Aged frame (wait %ld ms) promoted Normal -> High",
                        port->id, elapsed_ms);
-                fflush(stdout);
             } else {
                 break;
             }
@@ -616,8 +752,7 @@ static void *port_tx_thread(void *arg) {
         if (sf) {
             int fd = atomic_load_explicit(&port->fd, memory_order_relaxed);
             if (fd >= 0 && write_frame(fd, &sf->frame) < 0) {
-                printf("[Switch] Port %d: TX write failed: %s\n", port->id, strerror(errno));
-                fflush(stdout);
+                async_log("[Switch] Port %d: TX write failed: %s", port->id, strerror(errno));
 
                 shared_frame_release(sf);
 
@@ -658,8 +793,7 @@ static void *port_tx_thread(void *arg) {
 static void *port_rx_thread(void *arg) {
     port_t *port = (port_t *)arg;
 
-    printf("[Switch] Port %d: Host connected\n", port->id);
-    fflush(stdout);
+    async_log("[Switch] Port %d: Host connected", port->id);
 
     frame_t frame;
     while (atomic_load_explicit(&g_running, memory_order_relaxed)) {
@@ -669,16 +803,14 @@ static void *port_rx_thread(void *arg) {
         }
         int rc = read_frame(fd, &frame);
         if (rc == 0) {
-            printf("[Switch] Port %d: Host disconnected cleanly\n", port->id);
-            fflush(stdout);
+            async_log("[Switch] Port %d: Host disconnected cleanly", port->id);
             break;
         }
         if (rc < 0) {
             if (atomic_load_explicit(&g_running, memory_order_relaxed) &&
                 atomic_load_explicit(&port->state, memory_order_relaxed) == PORT_STATE_ACTIVE) {
-                printf("[Switch] Port %d: Read error / disconnect: %s\n",
+                async_log("[Switch] Port %d: Read error / disconnect: %s",
                        port->id, strerror(errno));
-                fflush(stdout);
             }
             break;
         }
@@ -711,16 +843,14 @@ static void *port_rx_thread(void *arg) {
             strncpy(dst_str, "??:??:??:??:??:??", sizeof(dst_str));
         }
 
-        printf("[Switch] Port %d (%s%u): RX src=%s dst=%s vlan=%u prio=%u len=%u\n",
+        async_log("[Switch] Port %d (%s%u): RX src=%s dst=%s vlan=%u prio=%u len=%u",
                port->id, is_trunk ? "trunk" : "vlan", is_trunk ? 0 : port_vlan,
                src_str, dst_str, frame.vlan, frame.priority, frame.length);
-        fflush(stdout);
 
         /* Learn source MAC and enforce port security per VLAN */
         int learn_rc = mac_table_learn(g_mac_table, frame.src, frame.vlan, port->id);
         if (learn_rc == MAC_TABLE_SECURITY_VIOLATION) {
-            printf("[Switch] Port %d: Port security shutdown triggered!\n", port->id);
-            fflush(stdout);
+            async_log("[Switch] Port %d: Port security shutdown triggered!", port->id);
             int sfd = atomic_load_explicit(&port->fd, memory_order_relaxed);
             if (sfd >= 0) {
                 shutdown(sfd, SHUT_RDWR);
@@ -757,8 +887,7 @@ static void *port_rx_thread(void *arg) {
                         g_shm->ports[port->id].frames_mirrored++;
                         pthread_mutex_unlock(&g_shm->lock);
                     }
-                    printf("[Mirror] Cloned frame from port %d to sniffer port %d\n", port->id, sniffer);
-                    fflush(stdout);
+                    async_log("[Mirror] Cloned frame from port %d to sniffer port %d", port->id, sniffer);
                 }
             }
         }
@@ -782,21 +911,18 @@ static void *port_rx_thread(void *arg) {
             /* Known destination MAC on same VLAN */
             if (dst_port == port->id) {
                 /* Filtered: destination sits on the incoming port */
-                printf("[Switch] Port %d: Frame filtered (dest sits on same port)\n", port->id);
-                fflush(stdout);
+                async_log("[Switch] Port %d: Frame filtered (dest sits on same port)", port->id);
             } else {
-                printf("[Switch] Port %d: Unicast forwarding to port %d (vlan=%u)\n",
+                async_log("[Switch] Port %d: Unicast forwarding to port %d (vlan=%u)",
                        port->id, dst_port, frame.vlan);
-                fflush(stdout);
                 if (dst_port != sniffer) {
                     port_enqueue(&g_ports[dst_port], sf);
                 }
             }
         } else {
             /* Broadcast or unknown destination: flood strictly within VLAN and to trunk ports */
-            printf("[Switch] Port %d: Flooding frame (dst=%s, vlan=%u)\n",
+            async_log("[Switch] Port %d: Flooding frame (dst=%s, vlan=%u)",
                    port->id, dst_str, frame.vlan);
-            fflush(stdout);
             for (int i = 0; i < g_num_ports; i++) {
                 if (i == port->id || i == sniffer) {
                     continue;
@@ -937,8 +1063,7 @@ static void reap_terminated_ports(void) {
                 }
             }
 
-            printf("[Switch] Port %d: Reaped and reset to free\n", i);
-            fflush(stdout);
+            async_log("[Switch] Port %d: Reaped and reset to free", i);
         }
     }
 }
@@ -1005,8 +1130,7 @@ static int allocate_port(int client_fd) {
 static void reload_config(const char *filename) {
     FILE *f = fopen(filename, "r");
     if (!f) {
-        printf("[Config] Note: %s not found (retaining current settings)\n", filename);
-        fflush(stdout);
+        async_log("[Config] Note: %s not found (retaining current settings)", filename);
         return;
     }
     char line[256];
@@ -1026,7 +1150,7 @@ static void reload_config(const char *filename) {
             sscanf(p, "port_%d_vlan=%d", &p_id, &v_id) == 2) {
             if (p_id >= 0 && p_id < g_num_ports && v_id >= 1 && v_id <= 4094) {
                 atomic_store_explicit(&g_ports[p_id].vlan_id, (uint16_t)v_id, memory_order_relaxed);
-                printf("[Config] Reloaded: port %d VLAN = %d\n", p_id, v_id);
+                async_log("[Config] Reloaded: port %d VLAN = %d", p_id, v_id);
             }
         } else if (sscanf(p, "trunk %d = %d", &t_port, &t_val) >= 1 ||
                    sscanf(p, "trunk %d %d", &t_port, &t_val) >= 1 ||
@@ -1034,19 +1158,19 @@ static void reload_config(const char *filename) {
                    sscanf(p, "port_%d_trunk = %d", &t_port, &t_val) >= 1) {
             if (t_port >= 0 && t_port < g_num_ports) {
                 atomic_store_explicit(&g_ports[t_port].is_trunk, (t_val != 0), memory_order_relaxed);
-                printf("[Config] Reloaded: port %d trunk = %s\n", t_port, (t_val != 0) ? "enabled" : "disabled");
+                async_log("[Config] Reloaded: port %d trunk = %s", t_port, (t_val != 0) ? "enabled" : "disabled");
             }
         } else if (sscanf(p, "mirror %d = %d", &m_src, &m_dst) == 2 ||
                    sscanf(p, "mirror %d %d", &m_src, &m_dst) == 2 ||
                    sscanf(p, "mirror_%d = %d", &m_src, &m_dst) == 2) {
             if (m_src >= 0 && m_src < g_num_ports && m_dst >= 0 && m_dst < g_num_ports && m_src != m_dst) {
                 atomic_store_explicit(&g_ports[m_src].mirror_dest, m_dst, memory_order_relaxed);
-                printf("[Config] Reloaded: mirroring port %d -> sniffer port %d\n", m_src, m_dst);
+                async_log("[Config] Reloaded: mirroring port %d -> sniffer port %d", m_src, m_dst);
             }
         } else if (sscanf(p, "nomirror %d", &m_src) == 1 || sscanf(p, "unmirror %d", &m_src) == 1) {
             if (m_src >= 0 && m_src < g_num_ports) {
                 atomic_store_explicit(&g_ports[m_src].mirror_dest, -1, memory_order_relaxed);
-                printf("[Config] Reloaded: disabled mirroring for port %d\n", m_src);
+                async_log("[Config] Reloaded: disabled mirroring for port %d", m_src);
             }
         } else if (sscanf(p, "%63[^= ] = %63s", key, val) == 2 ||
                    sscanf(p, "%63[^= ]=%63s", key, val) == 2) {
@@ -1054,13 +1178,13 @@ static void reload_config(const char *filename) {
                 int t = atoi(val);
                 if (t > 0 && g_mac_table) {
                     atomic_store_explicit(&g_mac_table->aging_seconds, t, memory_order_relaxed);
-                    printf("[Config] Reloaded: aging_time = %d seconds\n", t);
+                    async_log("[Config] Reloaded: aging_time = %d seconds", t);
                 }
             } else if (strcmp(key, "mac_limit") == 0) {
                 int m = atoi(val);
                 if (m > 0 && g_mac_table) {
                     atomic_store_explicit(&g_mac_table->max_per_port, m, memory_order_relaxed);
-                    printf("[Config] Reloaded: mac_limit = %d per port\n", m);
+                    async_log("[Config] Reloaded: mac_limit = %d per port", m);
                 }
             } else if (strcmp(key, "rate_limit") == 0) {
                 int r = atoi(val);
@@ -1071,7 +1195,7 @@ static void reload_config(const char *filename) {
                         g_ports[i].rate_limit = r;
                         pthread_mutex_unlock(&g_ports[i].queue_mutex);
                     }
-                    printf("[Config] Reloaded: rate_limit = %d frames/sec\n", r);
+                    async_log("[Config] Reloaded: rate_limit = %d frames/sec", r);
                 }
             }
         }
@@ -1263,6 +1387,12 @@ int main(int argc, char *argv[]) {
     }
     if (mac_table_init(g_mac_table, 1024, 16, 30) < 0) {
         fprintf(stderr, "mac_table_init failed\n");
+        return 1;
+    }
+
+    /* Start background async logger thread before config reload */
+    if (logger_init() != 0) {
+        fprintf(stderr, "logger_init failed\n");
         return 1;
     }
 
@@ -1544,6 +1674,7 @@ int main(int argc, char *argv[]) {
     }
     shm_unlink(SHM_STATS_NAME);
 
+    logger_shutdown();
     printf("[Switch] Teardown complete. All resources freed.\n");
     fflush(stdout);
     return 0;
