@@ -5,11 +5,13 @@
 #include <unistd.h>
 #include <errno.h>
 
-static inline unsigned int mac_hash(const uint8_t mac[MAC_LEN]) {
+static inline unsigned int mac_hash(const uint8_t mac[MAC_LEN], uint16_t vlan) {
     unsigned int hash = 5381;
     for (int i = 0; i < MAC_LEN; i++) {
         hash = ((hash << 5) + hash) + mac[i];
     }
+    hash = ((hash << 5) + hash) + (uint8_t)(vlan & 0xFF);
+    hash = ((hash << 5) + hash) + (uint8_t)((vlan >> 8) & 0xFF);
     return hash % MAC_TABLE_BUCKETS;
 }
 
@@ -21,6 +23,7 @@ static void evict_lru_entry(mac_table_t *table) {
     int best_bucket = -1;
     time_t oldest_time = (time_t)0x7FFFFFFF;
     uint8_t oldest_mac[MAC_LEN];
+    uint16_t oldest_vlan = 0;
     bool found = false;
 
     for (int b = 0; b < MAC_TABLE_BUCKETS; b++) {
@@ -30,6 +33,7 @@ static void evict_lru_entry(mac_table_t *table) {
             if (curr->last_seen < oldest_time) {
                 oldest_time = curr->last_seen;
                 memcpy(oldest_mac, curr->mac, MAC_LEN);
+                oldest_vlan = curr->vlan;
                 best_bucket = b;
                 found = true;
             }
@@ -46,15 +50,15 @@ static void evict_lru_entry(mac_table_t *table) {
     mac_entry_t **pcurr = &table->buckets[best_bucket].head;
     while (*pcurr) {
         mac_entry_t *target = *pcurr;
-        if (mac_equals(target->mac, oldest_mac)) {
+        if (mac_equals(target->mac, oldest_mac) && target->vlan == oldest_vlan) {
             *pcurr = target->next;
             atomic_fetch_sub_explicit(&table->port_mac_count[target->port_id], 1, memory_order_relaxed);
             atomic_fetch_sub_explicit(&table->total_entries, 1, memory_order_relaxed);
 
             char mac_str[MAC_STR_LEN];
             mac_to_str(target->mac, mac_str, sizeof(mac_str));
-            printf("[MAC Table] LRU eviction: removed MAC %s from port %d\n",
-                   mac_str, target->port_id);
+            printf("[MAC Table] LRU eviction: removed MAC %s on VLAN %u from port %d\n",
+                   mac_str, target->vlan, target->port_id);
             fflush(stdout);
 
             free(target);
@@ -102,8 +106,8 @@ static void *mac_table_aging_thread(void *arg) {
 
                     char mac_str[MAC_STR_LEN];
                     mac_to_str(entry->mac, mac_str, sizeof(mac_str));
-                    printf("[MAC Table] Aging: removed MAC %s from port %d (idle %ld s)\n",
-                           mac_str, entry->port_id, (long)(now - entry->last_seen));
+                    printf("[MAC Table] Aging: removed MAC %s on VLAN %u from port %d (idle %ld s)\n",
+                           mac_str, entry->vlan, entry->port_id, (long)(now - entry->last_seen));
                     fflush(stdout);
 
                     free(entry);
@@ -161,7 +165,7 @@ int mac_table_init(mac_table_t *table, int max_entries_k, int max_per_port_m, in
     return 0;
 }
 
-int mac_table_learn(mac_table_t *table, const uint8_t mac[MAC_LEN], int port_id) {
+int mac_table_learn(mac_table_t *table, const uint8_t mac[MAC_LEN], uint16_t vlan, int port_id) {
     if (!table || !mac || port_id < 0 || port_id >= MAX_SWITCH_PORTS) {
         return MAC_TABLE_ERR;
     }
@@ -169,16 +173,16 @@ int mac_table_learn(mac_table_t *table, const uint8_t mac[MAC_LEN], int port_id)
         return MAC_TABLE_OK;
     }
 
-    unsigned int b = mac_hash(mac);
+    unsigned int b = mac_hash(mac, vlan);
     time_t now = time(NULL);
 
     pthread_mutex_lock(&table->buckets[b].lock);
     mac_entry_t *entry = table->buckets[b].head;
     while (entry) {
-        if (mac_equals(entry->mac, mac)) {
+        if (mac_equals(entry->mac, mac) && entry->vlan == vlan) {
             entry->last_seen = now;
             if (entry->port_id != port_id) {
-                /* Host moved to a new port */
+                /* Host moved to a new port on the same VLAN */
                 int old_port = entry->port_id;
                 if (atomic_load_explicit(&table->port_mac_count[port_id], memory_order_relaxed) >= table->max_per_port) {
                     pthread_mutex_unlock(&table->buckets[b].lock);
@@ -194,8 +198,8 @@ int mac_table_learn(mac_table_t *table, const uint8_t mac[MAC_LEN], int port_id)
 
                 char mac_str[MAC_STR_LEN];
                 mac_to_str(mac, mac_str, sizeof(mac_str));
-                printf("[MAC Table] MAC %s moved from port %d to port %d (MAC moved)\n",
-                       mac_str, old_port, port_id);
+                printf("[MAC Table] MAC %s moved from port %d to port %d on VLAN %u (MAC moved)\n",
+                       mac_str, old_port, port_id, vlan);
                 fflush(stdout);
                 pthread_mutex_unlock(&table->buckets[b].lock);
                 return MAC_TABLE_MOVED;
@@ -226,7 +230,7 @@ int mac_table_learn(mac_table_t *table, const uint8_t mac[MAC_LEN], int port_id)
         /* Recheck if another thread inserted this MAC while unlocked */
         entry = table->buckets[b].head;
         while (entry) {
-            if (mac_equals(entry->mac, mac)) {
+            if (mac_equals(entry->mac, mac) && entry->vlan == vlan) {
                 entry->last_seen = now;
                 pthread_mutex_unlock(&table->buckets[b].lock);
                 return MAC_TABLE_OK;
@@ -241,6 +245,7 @@ int mac_table_learn(mac_table_t *table, const uint8_t mac[MAC_LEN], int port_id)
         return MAC_TABLE_ERR;
     }
     memcpy(new_entry->mac, mac, MAC_LEN);
+    new_entry->vlan = vlan;
     new_entry->port_id = port_id;
     new_entry->last_seen = now;
     new_entry->next = table->buckets[b].head;
@@ -251,15 +256,15 @@ int mac_table_learn(mac_table_t *table, const uint8_t mac[MAC_LEN], int port_id)
 
     char mac_str[MAC_STR_LEN];
     mac_to_str(mac, mac_str, sizeof(mac_str));
-    printf("[MAC Table] Learned MAC %s on port %d (total: %d)\n",
-           mac_str, port_id, atomic_load_explicit(&table->total_entries, memory_order_relaxed));
+    printf("[MAC Table] Learned MAC %s on port %d VLAN %u (total: %d)\n",
+           mac_str, port_id, vlan, atomic_load_explicit(&table->total_entries, memory_order_relaxed));
     fflush(stdout);
 
     pthread_mutex_unlock(&table->buckets[b].lock);
     return MAC_TABLE_OK;
 }
 
-int mac_table_lookup(mac_table_t *table, const uint8_t mac[MAC_LEN]) {
+int mac_table_lookup(mac_table_t *table, const uint8_t mac[MAC_LEN], uint16_t vlan) {
     if (!table || !mac) {
         return -1;
     }
@@ -267,14 +272,14 @@ int mac_table_lookup(mac_table_t *table, const uint8_t mac[MAC_LEN]) {
         return -1;
     }
 
-    unsigned int b = mac_hash(mac);
+    unsigned int b = mac_hash(mac, vlan);
     time_t now = time(NULL);
     int port_id = -1;
 
     pthread_mutex_lock(&table->buckets[b].lock);
     mac_entry_t *entry = table->buckets[b].head;
     while (entry) {
-        if (mac_equals(entry->mac, mac)) {
+        if (mac_equals(entry->mac, mac) && entry->vlan == vlan) {
             entry->last_seen = now;
             port_id = entry->port_id;
             break;
@@ -323,7 +328,7 @@ int mac_table_dump(mac_table_t *table, const char *filepath) {
     time_t now = time(NULL);
     fprintf(f, "# MAC Table Dump\n");
     fprintf(f, "# Total entries: %d\n", atomic_load_explicit(&table->total_entries, memory_order_relaxed));
-    fprintf(f, "# %-17s  %-5s  %-8s\n", "MAC Address", "Port", "Idle(s)");
+    fprintf(f, "# %-17s  %-5s  %-5s  %-8s\n", "MAC Address", "VLAN", "Port", "Idle(s)");
 
     for (int b = 0; b < MAC_TABLE_BUCKETS; b++) {
         pthread_mutex_lock(&table->buckets[b].lock);
@@ -332,7 +337,7 @@ int mac_table_dump(mac_table_t *table, const char *filepath) {
             char mac_str[MAC_STR_LEN];
             mac_to_str(entry->mac, mac_str, sizeof(mac_str));
             long idle = (long)(now - entry->last_seen);
-            fprintf(f, "%-17s  %-5d  %ld\n", mac_str, entry->port_id, idle);
+            fprintf(f, "%-17s  %-5u  %-5d  %ld\n", mac_str, entry->vlan, entry->port_id, idle);
             entry = entry->next;
         }
         pthread_mutex_unlock(&table->buckets[b].lock);

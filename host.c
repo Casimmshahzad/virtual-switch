@@ -186,6 +186,49 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
+    /* Test mode: one-shot VLAN send */
+    if (argc >= 7 && strcmp(argv[4], "--vlan") == 0) {
+        int vlan = atoi(argv[5]);
+        if (vlan < 1 || vlan > 4094) {
+            fprintf(stderr, "Error: Invalid VLAN: %s (must be 1..4094)\n", argv[5]);
+            close(sock_fd);
+            return 1;
+        }
+        uint8_t dst_mac[MAC_LEN];
+        if (mac_from_str(argv[6], dst_mac) < 0) {
+            fprintf(stderr, "Error: Invalid dst_mac: %s\n", argv[6]);
+            close(sock_fd);
+            return 1;
+        }
+        const char *payload = (argc >= 8) ? argv[7] : "";
+        size_t p_len = strlen(payload);
+        if (p_len > MAX_PAYLOAD_LEN) p_len = MAX_PAYLOAD_LEN;
+
+        frame_t tx_frame;
+        memset(&tx_frame, 0, sizeof(tx_frame));
+        tx_frame.length = (uint16_t)p_len;
+        memcpy(tx_frame.src, host_mac, MAC_LEN);
+        memcpy(tx_frame.dst, dst_mac, MAC_LEN);
+        tx_frame.vlan = (uint16_t)vlan;
+        tx_frame.priority = PRIORITY_NORMAL;
+        memcpy(tx_frame.payload, payload, p_len);
+
+        if (write_frame(sock_fd, &tx_frame) < 0) {
+            perror("write_frame");
+            close(sock_fd);
+            return 1;
+        }
+        printf("[Host %s] TX: vlan=%d dst=%s len=%u payload='%.*s'\n",
+               host_mac_str, vlan, argv[6], (unsigned int)p_len, (int)p_len, payload);
+        fflush(stdout);
+
+        if (close(sock_fd) < 0) {
+            perror("close sock_fd");
+            return 1;
+        }
+        return 0;
+    }
+
     /* Test mode: frozen host that never reads from socket */
     if (argc >= 5 && strcmp(argv[4], "--no-read") == 0) {
         /* Restrict receive buffer so TCP window fills quickly */
@@ -356,10 +399,23 @@ int main(int argc, char *argv[]) {
         uint8_t tx_dst[MAC_LEN];
         memcpy(tx_src, host_mac, MAC_LEN);
         uint8_t frame_prio = PRIORITY_NORMAL;
+        uint16_t frame_vlan = 1;
 
+        char vlan_str[16];
         char prio_str[16];
         char spoof_src[64], spoof_dst[64];
-        if (sscanf(line, "prio %15s %63s %1500[^\n]", prio_str, dst_str, payload_str) >= 2) {
+        if (sscanf(line, "vlan %15s %63s %1500[^\n]", vlan_str, dst_str, payload_str) >= 2) {
+            int v = atoi(vlan_str);
+            if (v < 1 || v > 4094) {
+                fprintf(stderr, "Error: Invalid VLAN (must be 1..4094)\n");
+                continue;
+            }
+            frame_vlan = (uint16_t)v;
+            if (mac_from_str(dst_str, tx_dst) < 0) {
+                fprintf(stderr, "Error: Invalid destination MAC: %s\n", dst_str);
+                continue;
+            }
+        } else if (sscanf(line, "prio %15s %63s %1500[^\n]", prio_str, dst_str, payload_str) >= 2) {
             int p = atoi(prio_str);
             if (p < 0 || p > 2) {
                 fprintf(stderr, "Error: Invalid priority (must be 0, 1, or 2)\n");
@@ -389,7 +445,7 @@ int main(int argc, char *argv[]) {
         tx_frame.length = (uint16_t)strlen(payload_str);
         memcpy(tx_frame.src, tx_src, MAC_LEN);
         memcpy(tx_frame.dst, tx_dst, MAC_LEN);
-        tx_frame.vlan = 1;
+        tx_frame.vlan = frame_vlan;
         tx_frame.priority = frame_prio;
         memcpy(tx_frame.payload, payload_str, tx_frame.length);
 

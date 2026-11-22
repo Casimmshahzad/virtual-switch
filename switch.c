@@ -102,6 +102,11 @@ typedef struct {
     int tokens;          /* available token balance */
     int token_ms_accum;  /* accumulated milliseconds for fractional token refill */
 
+    /* VLAN and Port Mirroring (Milestone 6) */
+    _Atomic uint16_t vlan_id;  /* Assigned VLAN ID (default 1) */
+    _Atomic bool is_trunk;     /* True if port is a trunk carrying all VLANs */
+    _Atomic int mirror_dest;   /* Target sniffer port ID, or -1 if disabled */
+
     _Atomic uint64_t frames_in;
     _Atomic uint64_t frames_out;
     _Atomic uint64_t frames_dropped;
@@ -419,6 +424,18 @@ static void *port_rx_thread(void *arg) {
 
         atomic_fetch_add_explicit(&port->frames_in, 1, memory_order_relaxed);
 
+        bool is_trunk = atomic_load_explicit(&port->is_trunk, memory_order_relaxed);
+        uint16_t port_vlan = atomic_load_explicit(&port->vlan_id, memory_order_relaxed);
+        if (!is_trunk) {
+            /* Access port: frames belong to the port's assigned VLAN */
+            frame.vlan = port_vlan;
+        } else {
+            /* Trunk port: preserves frame.vlan (default to 1 if 0) */
+            if (frame.vlan == 0) {
+                frame.vlan = 1;
+            }
+        }
+
         char src_str[MAC_STR_LEN];
         char dst_str[MAC_STR_LEN];
         if (mac_to_str(frame.src, src_str, sizeof(src_str)) < 0) {
@@ -428,12 +445,13 @@ static void *port_rx_thread(void *arg) {
             strncpy(dst_str, "??:??:??:??:??:??", sizeof(dst_str));
         }
 
-        printf("[Switch] Port %d: RX src=%s dst=%s vlan=%u prio=%u len=%u\n",
-               port->id, src_str, dst_str, frame.vlan, frame.priority, frame.length);
+        printf("[Switch] Port %d (%s%u): RX src=%s dst=%s vlan=%u prio=%u len=%u\n",
+               port->id, is_trunk ? "trunk" : "vlan", is_trunk ? 0 : port_vlan,
+               src_str, dst_str, frame.vlan, frame.priority, frame.length);
         fflush(stdout);
 
-        /* Learn source MAC and enforce port security */
-        int learn_rc = mac_table_learn(g_mac_table, frame.src, port->id);
+        /* Learn source MAC and enforce port security per VLAN */
+        int learn_rc = mac_table_learn(g_mac_table, frame.src, frame.vlan, port->id);
         if (learn_rc == MAC_TABLE_SECURITY_VIOLATION) {
             printf("[Switch] Port %d: Port security shutdown triggered!\n", port->id);
             fflush(stdout);
@@ -450,31 +468,63 @@ static void *port_rx_thread(void *arg) {
             continue;
         }
 
+        /* Port Mirroring: clone ingress frame to sniffer port without blocking */
+        int sniffer = atomic_load_explicit(&port->mirror_dest, memory_order_relaxed);
+        if (sniffer >= 0 && sniffer < g_num_ports && sniffer != port->id) {
+            if (atomic_load_explicit(&g_ports[sniffer].state, memory_order_relaxed) == PORT_STATE_ACTIVE) {
+                if (port_enqueue(&g_ports[sniffer], sf) == 0) {
+                    printf("[Mirror] Cloned frame from port %d to sniffer port %d\n", port->id, sniffer);
+                    fflush(stdout);
+                }
+            }
+        }
+
         int dst_port = -1;
         if (!mac_is_broadcast(frame.dst)) {
-            dst_port = mac_table_lookup(g_mac_table, frame.dst);
+            dst_port = mac_table_lookup(g_mac_table, frame.dst, frame.vlan);
         }
 
         if (dst_port >= 0) {
-            /* Known destination MAC */
+            /* Verify that destination port can carry this VLAN */
+            bool dst_is_trunk = atomic_load_explicit(&g_ports[dst_port].is_trunk, memory_order_relaxed);
+            uint16_t dst_vlan = atomic_load_explicit(&g_ports[dst_port].vlan_id, memory_order_relaxed);
+            if (!dst_is_trunk && dst_vlan != frame.vlan) {
+                /* Destination port is on another VLAN: drop/filter */
+                dst_port = -1;
+            }
+        }
+
+        if (dst_port >= 0) {
+            /* Known destination MAC on same VLAN */
             if (dst_port == port->id) {
                 /* Filtered: destination sits on the incoming port */
                 printf("[Switch] Port %d: Frame filtered (dest sits on same port)\n", port->id);
                 fflush(stdout);
             } else {
-                printf("[Switch] Port %d: Unicast forwarding to port %d\n", port->id, dst_port);
+                printf("[Switch] Port %d: Unicast forwarding to port %d (vlan=%u)\n",
+                       port->id, dst_port, frame.vlan);
                 fflush(stdout);
-                port_enqueue(&g_ports[dst_port], sf);
+                if (dst_port != sniffer) {
+                    port_enqueue(&g_ports[dst_port], sf);
+                }
             }
         } else {
-            /* Broadcast or unknown unicast: flood to all other active ports */
-            printf("[Switch] Port %d: Flooding frame (dst=%s)\n", port->id, dst_str);
+            /* Broadcast or unknown destination: flood strictly within VLAN and to trunk ports */
+            printf("[Switch] Port %d: Flooding frame (dst=%s, vlan=%u)\n",
+                   port->id, dst_str, frame.vlan);
             fflush(stdout);
             for (int i = 0; i < g_num_ports; i++) {
-                if (i == port->id) {
+                if (i == port->id || i == sniffer) {
                     continue;
                 }
-                port_enqueue(&g_ports[i], sf);
+                if (atomic_load_explicit(&g_ports[i].state, memory_order_relaxed) != PORT_STATE_ACTIVE) {
+                    continue;
+                }
+                bool i_trunk = atomic_load_explicit(&g_ports[i].is_trunk, memory_order_relaxed);
+                uint16_t i_vlan = atomic_load_explicit(&g_ports[i].vlan_id, memory_order_relaxed);
+                if (i_trunk || i_vlan == frame.vlan) {
+                    port_enqueue(&g_ports[i], sf);
+                }
             }
         }
 
@@ -682,8 +732,40 @@ static void reload_config(const char *filename) {
         if (*p == '#' || *p == '\n' || *p == '\0') continue;
 
         char key[64], val[64];
-        if (sscanf(p, "%63[^= ] = %63s", key, val) == 2 ||
-            sscanf(p, "%63[^= ]=%63s", key, val) == 2) {
+        int p_id, v_id;
+        int t_port, t_val = 1;
+        int m_src, m_dst;
+
+        if (sscanf(p, "vlan %d = %d", &p_id, &v_id) == 2 ||
+            sscanf(p, "vlan %d %d", &p_id, &v_id) == 2 ||
+            sscanf(p, "port_%d_vlan = %d", &p_id, &v_id) == 2 ||
+            sscanf(p, "port_%d_vlan=%d", &p_id, &v_id) == 2) {
+            if (p_id >= 0 && p_id < g_num_ports && v_id >= 1 && v_id <= 4094) {
+                atomic_store_explicit(&g_ports[p_id].vlan_id, (uint16_t)v_id, memory_order_relaxed);
+                printf("[Config] Reloaded: port %d VLAN = %d\n", p_id, v_id);
+            }
+        } else if (sscanf(p, "trunk %d = %d", &t_port, &t_val) >= 1 ||
+                   sscanf(p, "trunk %d %d", &t_port, &t_val) >= 1 ||
+                   sscanf(p, "trunk_port = %d", &t_port) == 1 ||
+                   sscanf(p, "port_%d_trunk = %d", &t_port, &t_val) >= 1) {
+            if (t_port >= 0 && t_port < g_num_ports) {
+                atomic_store_explicit(&g_ports[t_port].is_trunk, (t_val != 0), memory_order_relaxed);
+                printf("[Config] Reloaded: port %d trunk = %s\n", t_port, (t_val != 0) ? "enabled" : "disabled");
+            }
+        } else if (sscanf(p, "mirror %d = %d", &m_src, &m_dst) == 2 ||
+                   sscanf(p, "mirror %d %d", &m_src, &m_dst) == 2 ||
+                   sscanf(p, "mirror_%d = %d", &m_src, &m_dst) == 2) {
+            if (m_src >= 0 && m_src < g_num_ports && m_dst >= 0 && m_dst < g_num_ports && m_src != m_dst) {
+                atomic_store_explicit(&g_ports[m_src].mirror_dest, m_dst, memory_order_relaxed);
+                printf("[Config] Reloaded: mirroring port %d -> sniffer port %d\n", m_src, m_dst);
+            }
+        } else if (sscanf(p, "nomirror %d", &m_src) == 1 || sscanf(p, "unmirror %d", &m_src) == 1) {
+            if (m_src >= 0 && m_src < g_num_ports) {
+                atomic_store_explicit(&g_ports[m_src].mirror_dest, -1, memory_order_relaxed);
+                printf("[Config] Reloaded: disabled mirroring for port %d\n", m_src);
+            }
+        } else if (sscanf(p, "%63[^= ] = %63s", key, val) == 2 ||
+                   sscanf(p, "%63[^= ]=%63s", key, val) == 2) {
             if (strcmp(key, "aging_time") == 0) {
                 int t = atoi(val);
                 if (t > 0 && g_mac_table) {
@@ -865,6 +947,10 @@ int main(int argc, char *argv[]) {
         g_ports[i].rate_limit = atomic_load_explicit(&g_default_rate_limit, memory_order_relaxed);
         g_ports[i].tokens = g_ports[i].rate_limit;
         g_ports[i].token_ms_accum = 0;
+
+        atomic_init(&g_ports[i].vlan_id, 1);
+        atomic_init(&g_ports[i].is_trunk, false);
+        atomic_init(&g_ports[i].mirror_dest, -1);
 
         atomic_init(&g_ports[i].frames_in, 0);
         atomic_init(&g_ports[i].frames_out, 0);

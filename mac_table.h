@@ -18,6 +18,7 @@
 
 typedef struct mac_entry {
     uint8_t mac[MAC_LEN];
+    uint16_t vlan;
     int port_id;
     time_t last_seen;
     struct mac_entry *next;
@@ -50,19 +51,19 @@ typedef struct {
 int mac_table_init(mac_table_t *table, int max_entries_k, int max_per_port_m, int aging_time_t);
 
 /*
- * Learns or refreshes source MAC mapping on port_id.
+ * Learns or refreshes source MAC mapping on (vlan, port_id).
  * Checks port security limit M and global capacity K with LRU eviction.
- * Detects and logs MAC moves.
+ * Detects and logs MAC moves within the same VLAN.
  * Returns MAC_TABLE_OK, MAC_TABLE_MOVED, or MAC_TABLE_SECURITY_VIOLATION.
  */
-int mac_table_learn(mac_table_t *table, const uint8_t mac[MAC_LEN], int port_id);
+int mac_table_learn(mac_table_t *table, const uint8_t mac[MAC_LEN], uint16_t vlan, int port_id);
 
 /*
- * Looks up destination port for given MAC address.
+ * Looks up destination port for given MAC address on specified VLAN.
  * Updates last_seen timestamp under bucket lock.
  * Returns port_id if found, or -1 if unknown or broadcast.
  */
-int mac_table_lookup(mac_table_t *table, const uint8_t mac[MAC_LEN]);
+int mac_table_lookup(mac_table_t *table, const uint8_t mac[MAC_LEN], uint16_t vlan);
 
 /*
  * Removes all MAC entries associated with a port (e.g. when port disconnects).
