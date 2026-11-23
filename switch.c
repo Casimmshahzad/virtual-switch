@@ -1118,6 +1118,8 @@ static int allocate_port(int client_fd) {
                 return -1;
             }
 
+            printf("[Switch] New host connected on port %d\n", i);
+            fflush(stdout);
             return i;
         }
     }
